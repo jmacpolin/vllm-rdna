@@ -161,6 +161,14 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                 quant_config,
                 f"{prefix}.shared_expert.down_proj",
             )
+            if (
+                shared_expert_group_size is None
+                and quant_config is not None
+                and quant_config.get_name() == "exl3"
+            ):
+                # EXL3 Hadamard-rotates each 128-wide block of the
+                # intermediate axis; a TP shard must hold whole blocks.
+                shared_expert_group_size = 128
             self.replicate_shared_expert = _should_replicate_misaligned_shared_expert(
                 config.shared_expert_intermediate_size,
                 self.tp_size,

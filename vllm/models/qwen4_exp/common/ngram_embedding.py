@@ -202,6 +202,15 @@ class Qwen4ExpPLEEmbeddingMethod(QuantizeMethodBase):
             quant_config, ModelOptQuantConfigBase
         ) and quant_config.is_layer_excluded(prefix):
             return Qwen4ExpPLEUnquantizedEmbeddingMethod()
+        if quant_config.get_name() == "exl3":
+            # exllamav3 ships the table as ngram_embedding.safetensors in its
+            # own row format; the PLE sidecar serves it (VLLM_PLE_CPU_OFFLOAD).
+            if not envs.VLLM_PLE_CPU_OFFLOAD:
+                raise ValueError(
+                    "EXL3 Qwen4Exp checkpoints need VLLM_PLE_CPU_OFFLOAD=1: the "
+                    "n-gram table is served by the PLE sidecar."
+                )
+            return Qwen4ExpPLEUnquantizedEmbeddingMethod()
         if isinstance(quant_config, CompressedTensorsConfig):
             # Weight-only compressed-tensors checkpoints (e.g. AWQ/GPTQ W4A16
             # Flash-Next) quantize Linear layers only; the PLE n-gram table

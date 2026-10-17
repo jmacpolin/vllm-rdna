@@ -14,6 +14,7 @@ The MTP draft model reuses the Qwen4Exp backbone (PLE/HC/MoE) but:
 """
 
 import contextlib
+import itertools
 from collections.abc import Iterable
 
 import regex as re
@@ -29,6 +30,7 @@ from vllm.model_executor.layers.fused_moe.utils import (
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import ColumnParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.quantization.exl3_ple import exl3_side_weights
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -478,6 +480,11 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts, LocalArgmaxMi
         return self.logits_processor(self.lm_head, hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # exllamav3 ships the drafter's mixer outside the model index.
+        weights = itertools.chain(
+            weights, exl3_side_weights("mtp_hyper_connection_mixer_patch.safetensors")
+        )
+
         def remap_weight_names():
             for name, weight in weights:
                 remapped_name = _remap_mtp_weight_name(name)

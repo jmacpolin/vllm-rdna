@@ -153,6 +153,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_FP4BMM: bool = True
     VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION: bool = False
     VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: bool = False
+    VLLM_ROCM_MONO_DECODE: bool = False
     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
     VLLM_ROCM_FP8_PADDING: bool = True
@@ -1405,6 +1406,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS", "False").lower()
         in ("true", "1")
     ),
+    # Alias of --monokernel (KernelConfig.monokernel), read in the API server
+    # by the ROCm platform and carried to the workers by the config.
+    # By default is disabled.
+    "VLLM_ROCM_MONO_DECODE": lambda: (
+        os.getenv("VLLM_ROCM_MONO_DECODE", "False").lower() in ("true", "1")
+    ),
     # Whether to use aiter triton kernels for gemm ops.
     # By default is enabled.
     "VLLM_ROCM_USE_AITER_TRITON_GEMM": lambda: (
@@ -1441,10 +1448,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # here so users explicitly enable it; the rdna_fork flips this to True.
     "VLLM_USE_RDNA2_FA": lambda: (
         os.getenv("VLLM_USE_RDNA2_FA", "False").lower() in ("true", "1")
-    ),
-    # Per-step phase timing in gpu_model_runner. Diagnostic only, off by default.
-    "DBG_VLLM_STEP_TIMING": lambda: (
-        os.getenv("DBG_VLLM_STEP_TIMING", "False").lower() in ("true", "1")
     ),
     # Bypass the "no more than two PCIe-only GPUs" XGMI-topology gate in
     # CustomAllreduce. For RDNA systems where PCIe P2P actually works

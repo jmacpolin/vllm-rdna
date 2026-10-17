@@ -34,6 +34,7 @@ actually sets.
 | `--linear-backend rdna2\|rdna_hybrid` | auto | Force the W4A16 linear kernel: `rdna2` = HIP decode+prefill; `rdna_hybrid` = skinny HIP + Triton (gfx10 dequant + rocBLAS at M ≥ 256). |
 | `--attention-backend RDNA_ATTN` | auto | FA-RDNA2 attention (gfx10x). The launcher's `ATTN=fa` sets it. |
 | `--speculative-config '{"method":"mtp","num_speculative_tokens":2,"use_local_argmax_reduction":true}'` | — | MTP=2. `use_local_argmax_reduction` avoids the drafter's vocab all-gather (required on TP=4). |
+| `--monokernel` | off | Qwen4Exp (Flash-Next) decode on the RDNA2 MonoKernel: K1 (HC preamble, <= 24 rows), K2 (FFN block, <= 8 rows), fused GDN core, QSA decode, all on. `VLLM_ROCM_MONO_DECODE=1` is an alias (read in the API server). Knobs: `--additional-config '{"rocm_mono_decode":{"k2_max_rows":8,"gdn":true,...}}'`, only read with the flag. Needs `GPU_MAX_HW_QUEUES=4` (the Flash-Next recipes set it). Unsupported deployments refuse at startup (`--monokernel <reason>.`). See `vllm/models/qwen4_exp/amd/mono/rdna2/README.md`. |
 
 ## Launcher knobs (`tools/rdna/serve_rdna.sh`)
 
@@ -77,7 +78,6 @@ actually sets.
 | `VLLM_RDNA_DENSE_INT8`, `_ONLY`, `_MIN_ROWS` | 0, 0, 64 | int8 weight-only shadow copies of dense fp16 projections for decode. Off in all recipes. |
 | `VLLM_RDNA_DENSE_GEMV` | 0 | Force `gemv_f16_rdna2` for n ≤ 5. **Never route anything to wvSplitK on gfx1030**: it asserts on device. |
 | `VLLM_DISABLED_KERNELS` | — | Upstream registry: e.g. `RDNA2W4A16LinearKernel` to fall back to Triton/Exllama. |
-| `VLLM_RDNA2_PREFILL_FORCE_CONFIG`, `_FORCE_SPLIT_K` | -1 | Pin the W4A16 HIP prefill tile/split-K (kernel A/B only). |
 
 ### MoE
 
@@ -113,7 +113,7 @@ actually sets.
 | `VLLM_RDNA_AR_BLOCKS`, `_PACE`, `_WAIT_MS` | auto, 0, — | Block cap, pacing, and peer-flag wait timeout. |
 | `VLLM_FORCE_CUSTOM_ALL_REDUCE` | 0 | Stock custom AR past the XGMI gates. **Keep 0**: it has crashed the host (PCI SERR). |
 | `NCCL_P2P_LEVEL=pxb`, `NCCL_PROTO=Simple`, `RCCL_P2P_NET_DISABLE=1`, `RCCL_P2P_BATCH_ENABLE=1`, `RCCL_MSCCL_ENABLE=0` | | RCCL settings for RDNA PCIe. LL/LL128 can deadlock. |
-| `GPU_MAX_HW_QUEUES` | launcher 2 | RDNA2 has 8 HQDs per GPU. 4 (HIP default) oversubscribes. |
+| `GPU_MAX_HW_QUEUES` | launcher 2 (flashnext TP4 recipes 4) | HIP streams per process; RDNA2 has 8 HQDs per GPU. Flash-Next TP4: 4 is neutral with the fork kernels off (MTP0/MTP2, 1k/16k, c=1/c=8; no "Runlist is getting oversubscribed") and fixes a per-rank skew from queue sharing at 2 when the persistent `rdna_mono_*` kernels are in the graph (2026-10-16). Other recipes keep 2 until measured. |
 
 ### Scheduler
 
@@ -204,9 +204,6 @@ path (correctness A/B only).
 - `VLLM_HIPPIHX`, `_LIB`, `_CODE_OBJECT`: route ops through a prebuilt hippihx
   V1 library when its plan is ready.
 - `VLLM_NO_PARTIAL_HASH=1`: disable partial-block prefix hits (debugging).
-- Recipes still set `VLLM_ROCM_MOE_PREFILL`, `VLLM_ROCM_SKIP_LIVE_TAIL_HASH`
-  and `VLLM_RDNA_FORCE_FP16`. Nothing in this tree reads them. Use
-  `--dtype float16` (the launcher does) for FP16.
 
 ### Diagnostics (off by default; slow, do not bench with them)
 
@@ -214,12 +211,14 @@ NaN tracing: `VLLM_{LAYER,MOE,HC,GDN,PLE}_NAN_DEBUG`, `VLLM_RDNA2_MOE_DEBUG_NAN`
 Kernel launch logs: `VLLM_RDNA2_W4A8_DEBUG`, `VLLM_RDNA2_W4A8_MOE_DEBUG`,
 `VLLM_RDNA2_PREFILL_DEBUG`, `VLLM_QSA_RDNA2_DEBUG`, `VLLM_CONV1D_DEBUG`,
 `VLLM_EXL3_DEBUG`, `VLLM_EXL3_HADAMARD_DBG`, `VLLM_PAGED_MQA_DEBUG_OOB`.
-Cache/scheduler traces: `VLLM_DEBUG_PREFIX_HIT`, `VLLM_TRACE_PREFIX_CACHE`,
-`VLLM_BT_DEBUG`, `VLLM_MAMBA_COPY_DEBUG`. Timing:
-`VLLM_RDNA_PHASE_TIMING=<every N steps>` (+ `VLLM_RDNA_OP_TIMING=1|2`),
-`VLLM_RDNA_SYNC_DEBUG`, `DBG_VLLM_STEP_TIMING`. Graph-pool memory:
-`VLLM_RDNA_POOLWATCH` (+ `_HISTORY`, `_DUMP_ON_REPLAY`). PLE sidecar:
+Cache/scheduler traces: `VLLM_DEBUG_PREFIX_HIT`, `VLLM_TRACE_PREFIX_CACHE`.
+Timing: `VLLM_RDNA_PHASE_TIMING=<every N steps>` (+ `VLLM_RDNA_OP_TIMING=1|2`),
+`VLLM_RDNA_SYNC_DEBUG`. PLE sidecar:
 `PLE_OFFLOAD_DEBUG_{HOPS,TRACE,DELAY_MS}`, `PLE_OFFLOAD_FUSED_CHECK`.
+GPU profiling: the launchers set `ROCPROFILER_REGISTER_ENABLED=0`, so the HIP/HSA
+runtimes never register with rocprofiler (no tool init, no queue interception)
+while serving. Set `ROCPROFILER_REGISTER_ENABLED=1` for torch-profiler or
+rocprofv3 GPU traces.
 
 ## TunableOp
 

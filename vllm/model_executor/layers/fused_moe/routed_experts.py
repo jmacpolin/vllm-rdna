@@ -673,6 +673,12 @@ class RoutedExperts(PluggableLayer):
         if expert_id == -1 and not use_global_sf:
             # Failed to load this param since it's not local to this rank
             return False if return_success else None
+        if quant_method_name == "Exl3MoEMethod":
+            # EXL3 trellis/suh/svh have their own layout and TP slicing.
+            self.quant_method.absorb(
+                self, loaded_weight, weight_name, shard_id, expert_id
+            )
+            return True if return_success else None
         # Hereafter, `expert_id` is local physical id
 
         # is_transposed: if the dim to shard the weight
@@ -915,8 +921,12 @@ class RoutedExperts(PluggableLayer):
         mapping_by_expert = _index_expert_mapping(expert_mapping)
 
         for expert_name, loaded_weight in weights:
+            if expert_name.endswith((".mul1", ".mcg")):
+                # EXL3 codebook markers (empty); the codebook comes from config.
+                continue
             qual_name = f"{self.layer_name}.{expert_name}"
-            is_fused = loaded_weight.dim() == 3
+            # An EXL3 trellis is 3-D per expert (tiles x tiles x words).
+            is_fused = loaded_weight.dim() == 3 and not expert_name.endswith(".trellis")
             # Fused tensors and ambiguous names keep the full mapping.
             candidates = expert_mapping
             if not is_fused and qual_name.count("experts.") == 1:
@@ -941,6 +951,14 @@ class RoutedExperts(PluggableLayer):
                 )
                 weight_name = qual_name.replace(weight_name, param_name)
                 param_name = weight_name.removeprefix(f"{self.layer_name}.")
+                # EXL3 checkpoints use .trellis/.suh/.svh instead of .weight:
+                # experts.E.gate_proj.trellis maps to experts.w13_trellis, but
+                # the parameter that owns the loader is still w13_weight.
+                for exl3_kind in ("trellis", "suh", "svh"):
+                    if param_name.endswith(exl3_kind):
+                        param_name = param_name[: -len(exl3_kind)] + "weight"
+                        weight_name = f"{param_name}.{exl3_kind}"
+                        break
                 param = getattr(self, param_name, None)
                 if param is None:
                     if param_name.endswith(("w13_bias", "w2_bias")):

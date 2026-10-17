@@ -149,7 +149,8 @@ TUNED_CONFIG=${TUNED_CONFIG:-0}
 # (~95 GB host RAM); int4 = INT4 table from PLE_QUANT_DIR in pinned RAM (~30 GB);
 # int4-disk = same INT4 table memory-mapped from disk, served by the CPU sidecar
 # (page cache only). PLE_QUANT_DIR is a ples_int4 directory from
-# primitive-ai/Qwen3.8-Flash-Next-PLE-quant.
+# primitive-ai/Qwen3.8-Flash-Next-PLE-quant. exl3 = the exllamav3 table shipped
+# with an EXL3 checkpoint (ngram_embedding.safetensors), served by the sidecar.
 PLE_QUANT_DIR=${PLE_QUANT_DIR:-${VLLM_PLE_QUANT_DIR:-}}
 if [[ -z ${PLE:-} ]]; then
     # Default follows the raw env vars when set the old way.
@@ -201,7 +202,15 @@ case $PLE in
             unset VLLM_PLE_CPU_OFFLOAD
         fi
         ;;
-    *) rdna_die "PLE must be bf16, int4 or int4-disk (got '$PLE')." ;;
+    exl3)
+        # exllamav3 checkpoints ship the table as ngram_embedding.safetensors;
+        # the CPU sidecar mmaps and decodes it (no PLE_QUANT_DIR).
+        unset VLLM_PLE_QUANT_DIR
+        PLE_QUANT_DIR=
+        export VLLM_PLE_CPU_OFFLOAD=1
+        export VLLM_PLE_OFFLOAD_READY_TIMEOUT=${VLLM_PLE_OFFLOAD_READY_TIMEOUT:-3600}
+        ;;
+    *) rdna_die "PLE must be bf16, int4, int4-disk or exl3 (got '$PLE')." ;;
 esac
 
 if [[ $TUNED_CONFIG == 1 ]]; then
@@ -332,7 +341,12 @@ for feat in $FEATURES; do
     case $feat in
         trust-remote-code) cmd+=(--trust-remote-code) ;;
         prefix-caching)
-            [[ $ENABLE_PREFIX_CACHING != 0 ]] && cmd+=(--enable-prefix-caching)
+            # vLLM enables prefix caching by default, so off must be explicit.
+            if [[ $ENABLE_PREFIX_CACHING != 0 ]]; then
+                cmd+=(--enable-prefix-caching)
+            else
+                cmd+=(--no-enable-prefix-caching)
+            fi
             ;;
         prompt-tokens-details) cmd+=(--enable-prompt-tokens-details) ;;
         auto-tool) cmd+=(--enable-auto-tool-choice --tool-call-parser qwen3_coder) ;;
@@ -362,8 +376,8 @@ rdse_quote() {
 RDSE_ENV_KEYS=(
     LD_LIBRARY_PATH ROCM_HOME ROCM_PATH HIP_PATH HIP_ROOT_DIR
     PYTHONPATH HF_HUB_OFFLINE TRANSFORMERS_OFFLINE
-    HIP_VISIBLE_DEVICES VLLM_WORKER_MULTIPROC_METHOD GPU_MAX_HW_QUEUES
-    VLLM_ROCM_USE_AITER VLLM_ROCM_USE_AITER_MOE VLLM_RDNA_FORCE_FP16
+    HIP_VISIBLE_DEVICES VLLM_WORKER_MULTIPROC_METHOD GPU_MAX_HW_QUEUES ROCPROFILER_REGISTER_ENABLED
+    VLLM_ROCM_USE_AITER VLLM_ROCM_USE_AITER_MOE VLLM_ROCM_MONO_DECODE
     TORCH_BLAS_PREFER_HIPBLASLT VLLM_BATCH_INVARIANT
     VLLM_CACHE_ROOT TRITON_CACHE_DIR TORCHINDUCTOR_CACHE_DIR TORCH_EXTENSIONS_DIR
     PYTORCH_TUNABLEOP_ENABLED PYTORCH_TUNABLEOP_TUNING
@@ -373,14 +387,14 @@ RDSE_ENV_KEYS=(
     FLASH_ATTENTION_TRITON_AMD_ENABLE
     VLLM_USE_V2_MODEL_RUNNER VLLM_USE_AOT_COMPILE VLLM_DISABLE_COMPILE_CACHE
     VLLM_USE_BREAKABLE_CUDAGRAPH VLLM_RDNA_FUSED_HC VLLM_RDNA_HC_PREFILL_FUSED
-    VLLM_ROCM_MOE_PREFILL VLLM_GDN_HIP_PREFILL VLLM_RDNA_FUSED_SE
+    VLLM_GDN_HIP_PREFILL VLLM_RDNA_FUSED_SE
     VLLM_RDNA_DENSE_INT8 VLLM_RDNA_DENSE_INT8_ONLY VLLM_RDNA_DENSE_GEMV
     VLLM_RDNA2_W4A8_SDOT4 VLLM_RDNA2_W4A8_DEBUG
     VLLM_FORCE_CUSTOM_ALL_REDUCE VLLM_RDNA_AR VLLM_RDNA_AR_MAX_KB
     VLLM_RDNA_AR_ONESHOT_KB VLLM_RDNA_AR_BLOCKS VLLM_RDNA_AR_PACE
     VLLM_CAUSAL_CONV1D_RDNA2_FWD VLLM_CAUSAL_CONV1D_RDNA2_UPDATE
     VLLM_ENABLE_STARTUP_PLAN VLLM_TUNED_CONFIG_FOLDER
-    VLLM_ROCM_SKIP_LIVE_TAIL_HASH VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS
+    VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS
     VLLM_PLE_CPU_OFFLOAD VLLM_PLE_OFFLOAD_READY_TIMEOUT VLLM_PLE_QUANT_DIR
     VLLM_EXL3_DEBUG
     VLLM_RDNA_DECODE_STALL_MS VLLM_RDNA_DECODE_SHARE VLLM_DECODE_STALL_MAX_OVERHEAD VLLM_DECODE_STALL_FIT_ALL

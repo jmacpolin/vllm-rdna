@@ -80,9 +80,12 @@ rdna_init() {
     export HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-${GPUIDS:-0,1,2,3}}
     export VLLM_WORKER_MULTIPROC_METHOD=${VLLM_WORKER_MULTIPROC_METHOD:-spawn}
     export GPU_MAX_HW_QUEUES=${GPU_MAX_HW_QUEUES:-2}
+    # Serving never attaches a GPU profiler: keep the HIP/HSA runtimes from
+    # registering with rocprofiler (no tool init, no queue interception).
+    # Profiling runs set ROCPROFILER_REGISTER_ENABLED=1.
+    export ROCPROFILER_REGISTER_ENABLED=${ROCPROFILER_REGISTER_ENABLED:-0}
     export VLLM_ROCM_USE_AITER=${VLLM_ROCM_USE_AITER:-0}
     export VLLM_ROCM_USE_AITER_MOE=${VLLM_ROCM_USE_AITER_MOE:-0}
-    export VLLM_RDNA_FORCE_FP16=${VLLM_RDNA_FORCE_FP16:-1}
     export TORCH_BLAS_PREFER_HIPBLASLT=${TORCH_BLAS_PREFER_HIPBLASLT:-0}
     export VLLM_BATCH_INVARIANT=${VLLM_BATCH_INVARIANT:-0}
 
@@ -143,13 +146,23 @@ rdna_run_cwd() {
 }
 
 rdna_kill_stale() {
-    local _sig _p
+    local _sig _p _sent
     for _sig in TERM KILL; do
+        _sent=0
         for _p in $(pgrep -f "entrypoints.cli.main serve|entrypoints.openai.api_server|VLLM::Worker|VLLM::EngineCore|PleOffloadWorker" 2>/dev/null); do
             [ -r "/proc/$_p/environ" ] || continue
-            tr '\0' '\n' < "/proc/$_p/environ" 2>/dev/null | grep -q "^VLLM_CACHE_ROOT=${VLLM_CACHE_ROOT}$" && kill -"$_sig" "$_p" 2>/dev/null
+            if tr '\0' '\n' < "/proc/$_p/environ" 2>/dev/null | grep -q "^VLLM_CACHE_ROOT=${VLLM_CACHE_ROOT}$"; then
+                if kill -"$_sig" "$_p" 2>/dev/null; then
+                    _sent=1
+                fi
+            fi
         done
-        [ "$_sig" = TERM ] && sleep 8
+        if [[ $_sent == 1 ]]; then
+            if [[ $_sig == TERM ]]; then
+                sleep 8
+            else
+                sleep 3
+            fi
+        fi
     done
-    sleep 3
 }

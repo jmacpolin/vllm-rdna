@@ -79,6 +79,7 @@ from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import MambaSpec
 
 from ..config import ATTENTION_LAYER_TYPES, QSA_LAYER_TYPE, Qwen4ExpConfig
+from . import mono_decode_rdna2
 from .hyperconnection import GatedResidual, HyperConnectionConfig
 from .low_latency_gemm import enable_qwen4_exp_low_latency_gemm
 from .ple_layer import Qwen4ExpPLELayer
@@ -141,6 +142,9 @@ _QWEN4_EXP_IGNORED_MISSING_SUFFIXES = [
     "_v_scale",
     "_weight_scale",
     "_input_scale",
+    # EXL3 codebook markers (empty tensors); the codebook comes from the config.
+    ".mul1",
+    ".mcg",
 ]
 
 # The checkpoint keeps down and injection projections separate; runtime packs
@@ -276,6 +280,11 @@ class Qwen4ExpDecoderLayer(nn.Module):
             prefix=maybe_prefix(prefix, "mlp_hyper_connection"),
         )
 
+        # --monokernel (gfx10x): forward-context names of this layer's K1 / K2
+        self._mono_k1, self._mono_k2 = mono_decode_rdna2.layer_hook(
+            self, vllm_config, prefix, is_moe_layer
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -307,7 +316,13 @@ class Qwen4ExpDecoderLayer(nn.Module):
             )
 
         # Fuse a pending combine with this HC module's mix when possible.
-        if prev_block_output is not None and prev_injection is not None:
+        if self._mono_k1 is not None:
+            hidden_states, block_input, injection = (
+                torch.ops.vllm.qwen4_exp_mono_k1_rdna2(
+                    hidden_states, prev_block_output, prev_injection, self._mono_k1
+                )
+            )
+        elif prev_block_output is not None and prev_injection is not None:
             hidden_states, block_input, injection = attn_hc.combine_and_mix(
                 hidden_states, prev_block_output, prev_injection
             )
@@ -334,6 +349,11 @@ class Qwen4ExpDecoderLayer(nn.Module):
             )
         else:
             raise ValueError("Invalid layer_type")
+
+        if self._mono_k2 is not None:
+            return torch.ops.vllm.qwen4_exp_mono_k2_rdna2(
+                hidden_states, attn_out, injection, self._mono_k2
+            )
 
         mlp_hc = self.mlp_hyper_connection
         hidden_states, block_input, injection = mlp_hc.combine_and_mix(
@@ -447,6 +467,7 @@ class Qwen4ExpModel(nn.Module):
             )
         )
         self.embed_tokens = VocabParallelEmbedding(self.vocab_size, config.hidden_size)
+        mono_decode_rdna2.install(vllm_config)  # --monokernel: checks + hooks
 
         def get_layer(prefix: str) -> Qwen4ExpDecoderLayer:
             layer_idx = extract_layer_index(prefix)
@@ -700,9 +721,17 @@ class Qwen4ExpForCausalLM(
         self.model = Qwen4ExpModel(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
+        # EXL3 checkpoints quantize the head (trellis/suh/svh); other formats
+        # ship it dense.
+        head_quant = (
+            self.quant_config
+            if self.quant_config is not None and self.quant_config.get_name() == "exl3"
+            else None
+        )
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,
+            quant_config=head_quant,
             prefix=maybe_prefix(prefix, "lm_head"),
         )
         self.logits_processor = LogitsProcessor(config.vocab_size)
