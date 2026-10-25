@@ -15,7 +15,10 @@ from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.model_executor.layers.rotary_embedding.mrope import triton_mrope
+from vllm.model_executor.layers.rotary_embedding.mrope import (
+    mrope_forward_rdna2,
+    triton_mrope,
+)
 from vllm.platforms.rdna import on_rdna_family
 from vllm.transformers_utils.configs.qwen4_exp import (
     Qwen4ExpTextConfig,
@@ -43,9 +46,23 @@ def apply_qsa_rope(
     cos, sin = cos_sin.chunk(2, dim=-1)
     if positions.ndim == 2:
         shape = tensor.shape
+        flat = tensor.reshape(num_tokens, -1)
+        dummy_key = tensor.new_empty((num_tokens, head_dim))
+        if mrope_forward_rdna2(
+            flat,
+            dummy_key,
+            cos,
+            sin,
+            head_dim,
+            rotary_dim,
+            rotary_emb.mrope_section,
+            rotary_emb.mrope_interleaved,
+            rotary_emb.is_neox_style,
+        ):
+            return flat.reshape(shape)
         tensor, _ = triton_mrope(
-            tensor.reshape(num_tokens, -1),
-            tensor.new_empty((num_tokens, head_dim)),
+            flat,
+            dummy_key,
             cos,
             sin,
             rotary_emb.mrope_section,
@@ -137,6 +154,17 @@ class QSAIndexer(nn.Module):
 
         # MonoKernel QSA part (--monokernel on gfx10x), else None
         self._mono_qsa = mono_decode_rdna2.qsa_part(vllm_config)
+        from .ops import qsa_rdna2
+
+        # The HIP QSA path without --monokernel runs the MonoKernel's indexer
+        # epilogue (one launch) and scoring (kernel + shape policy, which
+        # needs the decode width).
+        self._hip_qsa = self._mono_qsa
+        if self._mono_qsa is None and qsa_rdna2.qsa_use_rdna2():
+            from .mono.rdna2 import qsa as mono_qsa
+
+            mono_qsa.DECODE_WIDTH = 1 + vllm_config.num_speculative_tokens
+            self._hip_qsa = mono_qsa
 
         self.layer_id = int(layer_id)
         self.index_n_heads = int(config.indexer_n_heads)
@@ -197,6 +225,14 @@ class QSAIndexer(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Project replicated Q/K, normalize+rotate Q, and preserve raw K."""
         qk, _ = self.index_qk_proj(hidden_states)
+        return self._qk_epilogue(qk, positions)
+
+    def _qk_epilogue(
+        self,
+        qk: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Normalize+rotate Q from the projection; return it and the raw K."""
         q_raw, token_k = qk.split(
             (
                 self.index_n_heads * self.index_head_dim,
@@ -295,6 +331,24 @@ class QSAIndexer(nn.Module):
             self.compress_ratio,
             rope_position_cache,
         )
+        if (
+            self._mono_qsa is not None
+            and rope_position_cache is not None
+            and self._mono_qsa.norm_rope_store3(
+                self.k_layernorm,
+                self.rotary_emb,
+                first_positions,
+                pooled,
+                self.compressed_key_cache.kv_cache,
+                compressed_metadata.slot_mapping,
+                raw_key_cache,
+                raw_metadata.slot_mapping,
+                token_k[:num_tokens],
+                rope_position_cache,
+                position_rows,
+            )
+        ):
+            return
         normalized = self.normalize_compressed_keys(pooled, first_positions)
         if (
             self._mono_qsa is not None
@@ -375,15 +429,31 @@ class QSAIndexer(nn.Module):
             return result
         raw_metadata, compressed_metadata = metadata
         num_tokens = raw_metadata.num_actual_tokens
-        q, token_k = self.project_qk(
-            hidden_states[:num_tokens], positions[..., :num_tokens]
-        )
-        self._update_and_compress(
-            token_k,
-            positions[..., :num_tokens],
-            raw_metadata,
-            compressed_metadata,
-        )
+        qk, _ = self.index_qk_proj(hidden_states[:num_tokens])
+        q = None
+        if self._hip_qsa is not None:
+            # q norm+RoPE, pooling, k norm+RoPE and the stores in one launch
+            q = self._hip_qsa.epilogue(
+                self.q_layernorm,
+                self.k_layernorm,
+                self.rotary_emb,
+                qk,
+                positions[..., :num_tokens],
+                raw_metadata,
+                compressed_metadata,
+                self.compress_ratio,
+                self.compressed_key_cache.kv_cache,
+                self.raw_key_cache.key_cache,
+                self.raw_key_cache.rope_position_cache,
+            )
+        if q is None:
+            q, token_k = self._qk_epilogue(qk, positions[..., :num_tokens])
+            self._update_and_compress(
+                token_k,
+                positions[..., :num_tokens],
+                raw_metadata,
+                compressed_metadata,
+            )
         if self.skip_topk:
             if out is None:
                 raise RuntimeError("QSA top-k reuse requires an output buffer")

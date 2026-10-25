@@ -38,6 +38,7 @@ from vllm.platforms import current_platform
 from vllm.transformers_utils.config import set_default_rope_theta
 from vllm.transformers_utils.repo_utils import get_hf_file_bytes
 from vllm.v1.attention.backend import AttentionType
+from vllm.v1.worker.gpu.phase_timer import phase_timer
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     get_eagle3_aux_layers_from_config,
 )
@@ -282,7 +283,17 @@ class DFlashQwen3Attention(nn.Module):
         with the context K/V from the target model's hidden states. This forward op
         computes attention for the query tokens only.
         See also: precompute_and_store_context_kv"""
+        timer = (
+            phase_timer
+            if phase_timer is not None
+            and not torch.compiler.is_compiling()
+            and phase_timer.cur is not None
+            and not torch.cuda.is_current_stream_capturing()
+            else None
+        )
         qkv, _ = self.qkv_proj(hidden_states)
+        if timer is not None:
+            timer.mark("dflash_qkv")
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         # Per-head RMSNorm
@@ -295,11 +306,17 @@ class DFlashQwen3Attention(nn.Module):
         ).view(k_shape)
 
         q, k = self.rotary_emb(positions, q, k)
+        if timer is not None:
+            timer.mark("dflash_qk_norm_rope")
 
         if self.v_scale is not None:
             v = v * self.v_scale
         attn_output = self.attn(q, k, v)
+        if timer is not None:
+            timer.mark("dflash_attention")
         output, _ = self.o_proj(attn_output)
+        if timer is not None:
+            timer.mark("dflash_attn_out")
         return output
 
 
@@ -587,13 +604,22 @@ class DFlashQwen3Model(nn.Module):
         head_dim: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # --- Fused KV projection (one GEMM for all layers) ---
-        normed_context_states = torch.empty_like(context_states)
-        ops.rms_norm(
-            normed_context_states,
-            context_states,
-            self._hidden_norm_weight,
-            self._rms_norm_eps,
-        )
+        if current_platform.is_rocm() and context_states.dtype == torch.bfloat16:
+            # The RDNA AOT RMSNorm op currently accepts FP16 only.
+            normed_context_states = F.rms_norm(
+                context_states,
+                (context_states.shape[-1],),
+                self._hidden_norm_weight,
+                self._rms_norm_eps,
+            )
+        else:
+            normed_context_states = torch.empty_like(context_states)
+            ops.rms_norm(
+                normed_context_states,
+                context_states,
+                self._hidden_norm_weight,
+                self._rms_norm_eps,
+            )
         if self._fused_kv_weight is not None:
             all_kv_flat = F.linear(
                 normed_context_states, self._fused_kv_weight, self._fused_kv_bias
@@ -622,6 +648,26 @@ class DFlashQwen3Model(nn.Module):
         # --- Grouped RMSNorm K across all layers ([L, num_ctx, nkv, hd]) ---
         # The weight is selected per layer by the outermost (layer) index.
         all_k_normed = torch.empty_like(all_k)
+        # The ROCm RMSNorm op accepts only 2D inputs. Each layer slice is 3D,
+        # so flatten its context/head axes while keeping the per-layer weight.
+        if current_platform.is_rocm():
+            for layer_idx in range(all_k.shape[0]):
+                k_slice = all_k[layer_idx].flatten(0, 1)
+                if all_k.dtype == torch.bfloat16:
+                    all_k_normed[layer_idx] = F.rms_norm(
+                        k_slice,
+                        (k_slice.shape[-1],),
+                        self._k_norm_weights[layer_idx],
+                        self._rms_norm_eps,
+                    ).view_as(all_k[layer_idx])
+                else:
+                    ops.rms_norm(
+                        all_k_normed[layer_idx].flatten(0, 1),
+                        k_slice,
+                        self._k_norm_weights[layer_idx],
+                        self._rms_norm_eps,
+                    )
+            return all_k_normed
         if current_platform.is_xpu():
             for layer_idx in range(all_k.shape[0]):
                 ops.rms_norm(
@@ -869,6 +915,11 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
                 "means the draft model's target_layer_ids reference layers that "
                 "do not exist in the target model (incompatible draft/target pair)."
             )
+        # The target's auxiliary states can be FP16 while a BF16 DFlash2
+        # projector retains the checkpoint's native range.
+        weight_dtype = self.model.fc.weight.dtype
+        if weight_dtype.is_floating_point:
+            hidden_states = hidden_states.to(weight_dtype)
         result = self.model.fc(hidden_states)
         if needs_squeeze:
             result = result.squeeze(0)

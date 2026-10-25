@@ -12,7 +12,7 @@
 #   source "$(dirname "${BASH_SOURCE[0]}")/rdna_launcher_common.sh"
 #   MODEL=/path/to/ckpt VENV=/path/to/venv
 #   rdna_init                 # tree, venv, ROCm SDK, shared vLLM env, caches
-#   rdna_tunableop            # honours TUNABLEOP=0/1 and TUNABLEOP_PROFILE
+#   rdna_tunableop            # honours TUNABLEOP=0/1, TUNABLEOP_PROFILE/ROOT
 #   rdna_select_attention fa  # fa | triton  (sets $attention_backend)
 #   rdna_mtp_args 2           # sets $spec_args and $capture_sizes
 #   rdna_kill_stale           # scoped to $VLLM_CACHE_ROOT
@@ -99,7 +99,8 @@ rdna_tunableop() {
     # shellcheck source=tools/rdna2_028/tunableop_env.sh
     source "$source_dir/tools/rdna2_028/tunableop_env.sh"
     if [[ ${TUNABLEOP:-1} == 1 ]]; then
-        configure_tunableop "$ROCM_SDK_LIB/librocblas.so.5" "$source_dir/tunableop" || return 1
+        configure_tunableop "$ROCM_SDK_LIB/librocblas.so.5" \
+            "${TUNABLEOP_ROOT:-$source_dir/tunableop}" || return 1
     else
         export PYTORCH_TUNABLEOP_ENABLED=0 PYTORCH_TUNABLEOP_TUNING=0
         export PYTORCH_TUNABLEOP_HIPBLASLT_ENABLED=0

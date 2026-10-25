@@ -29,8 +29,14 @@ VLLM_RDNA_AR_WAIT_MS bounds each one-shot wait in wall-clock time (default
 complete are logged as a late peer.
 
 T44b wedge handling: a wait-bound abort records phase/peer/sequence in a
-host-mapped word. rdna_ar_check() reads it once per engine step and fails
-the step with a marker under VLLM_CACHE_ROOT so the next boot stays on RCCL.
+host-mapped word, and the abort is sticky in the kernel: later collectives on
+that instance skip their waits (output = local input, sequence still announced
+so peers move on), so a CUDA-graph step finishes instead of re-spinning to the
+engine's execute timeout. rdna_ar_check() reads every live instance's record
+once per engine step (the TP and the EP group each get their own instance)
+and fails the step -- the engine stops with "rdna_ar wedged" -- after writing
+a marker under VLLM_CACHE_ROOT so the next boot stays on RCCL. Results of the
+failing step are wrong by construction; nothing reroutes it live.
 """
 
 from __future__ import annotations
@@ -119,23 +125,18 @@ def describe_late(code: int, rank: int) -> str:
     return f"rank {rank} waited ~{ms} ms for peer rank {peer} at collective #{seq}"
 
 
-# False = not looked up yet; None = no TP / inactive; else the TP instance.
-_active: RdnaOneShotAllReduce | None | bool = False
+# Every instance that passed its self-test, in creation order (one per
+# process group: TP, EP, ...). Each has its own staging, sequence and abort
+# word, so a wedge on one does not stall the others, but any wedge fails the
+# step.
+_live: list[RdnaOneShotAllReduce] = []
 
 
 def rdna_ar_check() -> None:
-    """Per-step wedge check; a no-op unless the fast path is active."""
-    global _active
-    if _active is False:
-        try:
-            from vllm.distributed.parallel_state import get_tp_group
-
-            _active = getattr(get_tp_group().device_communicator, "rdna_ar_comm", None)
-        except Exception:  # noqa: BLE001 -- no TP group (single rank / not init)
-            _active = None
-    active = _active
-    if isinstance(active, RdnaOneShotAllReduce) and not active.disabled:
-        active.check()
+    """Per-step wedge check of every live instance (no-op when none)."""
+    for inst in _live:
+        if not inst.disabled:
+            inst.check()
 
 
 class RdnaOneShotAllReduce:
@@ -263,6 +264,7 @@ class RdnaOneShotAllReduce:
             return
         dist.barrier(group=group)
         self.disabled = False
+        _live.append(self)
         logger.info(
             "rdna_ar: one-shot all-reduce active (handle %d, rank %d/%d, "
             "devices %s, pix=%s, up to %d KB, RCCL above; "

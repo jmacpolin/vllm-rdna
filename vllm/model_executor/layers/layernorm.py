@@ -100,6 +100,19 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if on_rdna_family() and x.dtype == torch.bfloat16:
+            # The RDNA AOT RMSNorm kernels only accept FP16. DFlash2 keeps
+            # its BF16 range even when its target is served in FP16.
+            assert self.variance_size_override is None
+            if residual is not None:
+                residual = x + residual
+            normalized = F.rms_norm(
+                residual if residual is not None else x,
+                (self.hidden_size,),
+                self.weight.data if self.has_weight else None,
+                self.variance_epsilon,
+            )
+            return (normalized, residual) if residual is not None else normalized
         if envs.VLLM_BATCH_INVARIANT:
             assert self.variance_size_override is None, (
                 "Batch invariance is not supported for variance_size_override"

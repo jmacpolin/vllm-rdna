@@ -196,7 +196,10 @@ extend-exclude = ["tests/models/fixtures/*", "tests/prompts/*", "tests/tokenizer
     "tests/v1/engine/test_fast_incdec_prefix_err.py", ".git/*", "csrc/cpu/sgl-kernels/*",
     "rust/src/chat/src/renderer/deepseek_v32/fixtures/*", "rust/src/parser/**",
     "rust/src/text/src/output/decoded.rs",
-    "rust/src/tokenizer/src/incremental.rs"]
+    "rust/src/tokenizer/src/incremental.rs",
+    # benchmark evidence: machine-generated disassembly, random-token payloads
+    # and captured logs. Spelling checking them yields hex/unicode false hits.
+    "bench_results/**"]
 ignore-hidden = false
 
 [tool.typos.default]
@@ -209,6 +212,8 @@ NOOPs = "NOOPs"
 nin_shortcut = "nin_shortcut"
 cudaDevAttrMaxSharedMemoryPerBlockOptin = "cudaDevAttrMaxSharedMemoryPerBlockOptin"
 sharedMemPerBlockOptin = "sharedMemPerBlockOptin"
+# GDN / HC kernel parameter names (a log, delta b) from the Qwen4Exp work.
+alog = "alog"
 
 depthwise_seperable_out_channel = "depthwise_seperable_out_channel"
 pard_token = "pard_token"
@@ -221,6 +226,9 @@ view_seperator = "view_seperator"
 inverse_std_variences = "inverse_std_variences"
 
 [tool.typos.default.extend-words]
+AER = "AER" # PCIe Advanced Error Reporting in preserved diagnostic logs.
+alog = "alog" # Log-A parameter name in the GDN kernel.
+halfs = "halfs" # Count of half-precision elements in kernel tile comments.
 Hel = "Hel"
 suh = "suh"
 wether = "wether"
@@ -256,6 +264,8 @@ wht = "wht"
 WHT = "WHT"
 # Huawei Compute Architecture for Neural Networks
 CANN = "CANN"
+# PCIe Advanced Error Reporting (AER) term used by the RDNA serving harness
+aer = "aer"
 
 [tool.uv]
 no-build-isolation-package = ["torch"]

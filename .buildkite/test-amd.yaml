@@ -1116,12 +1116,15 @@ steps:
   - tests/distributed/
   - tests/v1/shutdown
   - tests/v1/worker/test_worker_memory_snapshot.py
+  - tests/models/qwen4_exp/test_mono_mtp_failstop.py
+  - vllm/models/qwen4_exp/amd/mono/rdna2/
   - vllm/platforms/rocm.py
   commands:
   - VLLM_TEST_SAME_HOST=1 torchrun --nproc-per-node=4 distributed/test_same_node.py | grep 'Same node test passed'
   - VLLM_TEST_SAME_HOST=1 VLLM_TEST_WITH_DEFAULT_DEVICE_SET=1 torchrun --nproc-per-node=4 distributed/test_same_node.py | grep 'Same node test passed'
   - HIP_VISIBLE_DEVICES=0,1 pytest -v -s v1/shutdown
   - pytest -v -s v1/worker/test_worker_memory_snapshot.py
+  - pytest -v -s models/qwen4_exp/test_mono_mtp_failstop.py
 
 - label: ":amd: (MI300) Distributed Compile + Comm" # TBD
   timeout_in_minutes: 45

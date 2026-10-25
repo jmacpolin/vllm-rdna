@@ -74,10 +74,18 @@
 // mid-serving, every later collective also spun to its cap and returned WITHOUT
 // writing its output, so a wedged P2P path looked like "one or three GPUs
 // pinned at 99 %, generation stopped" for the 300 s engine timeout (two boards
-// reported it). Now the first block to hit the cap claims the device word
+// reported it). The first block to hit the cap claims the device word
 // `timeout` (atomicCAS, device scope) and writes one 64-bit code into `report`,
 // a host-mapped mirror the Python side polls once per step with a plain load --
-// no device sync, no PCIe atomics:
+// no device sync, no PCIe atomics.
+// The record alone did not stop the re-spinning: the host reads it only after
+// the step, and a CUDA-graph step holds ~100 collectives, each of which waited
+// up to the bound again (the 300 s engine timeout still came first). So the
+// claim is sticky in the kernel too (2026-10-18): a collective launched after
+// it skips its push and waits, copies `in` to `out` (a finite, wrong local
+// value), and still announces its sequence number so peers do not wait on
+// this rank. The step then completes and rdna_ar_check() fails it with the
+// record. Layout:
 //   bits 0-7   1 = aborted          bits 8-11  phase: 1 = own blocks' grid
 //   barrier, bits 12-15 peer rank (phase 2)                    2 = a peer's
 //   flag never arrived bits 16-31 wait time (see below) bits 32-63 sequence
@@ -193,12 +201,27 @@ __global__ void rdna_ar_oneshot(
     s_seq =
         __hip_atomic_load(seqbuf, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) +
         1;
-    s_abort = 0;
+    // Sticky abort (see the T44b note): an earlier collective on this
+    // instance timed out, so this one must not wait again.
+    s_abort = __hip_atomic_load(timeout, __ATOMIC_RELAXED,
+                                __HIP_MEMORY_SCOPE_AGENT) != 0u;
   }
   __syncthreads();
   const int seq = s_seq;
   const int p = seq & 1;
   const int gid = b * nt + t, gstride = nblocks * nt;
+  if (s_abort) {
+    if (b == 0 && t == 0) {
+      // Keep the sequence moving and release peers waiting on this rank.
+      __hip_atomic_store(seqbuf, seq, __ATOMIC_RELEASE,
+                         __HIP_MEMORY_SCOPE_AGENT);
+      for (int j = 0; j < world; j++)
+        __hip_atomic_store(&peers.flags[j][rank], seq, __ATOMIC_RELEASE,
+                           __HIP_MEMORY_SCOPE_SYSTEM);
+    }
+    for (int i = gid; i < n; i += gstride) out[i] = in[i];
+    return;
+  }
 
   // 1. push our slice into every peer's staging slot for us (posted PCIe
   // writes).
@@ -279,7 +302,11 @@ __global__ void rdna_ar_oneshot(
     }
   }
   __syncthreads();
-  if (s_abort) return;
+  if (s_abort) {
+    // Timed out here: leave a finite (wrong) value, never stale memory.
+    for (int i = gid; i < n; i += gstride) out[i] = in[i];
+    return;
+  }
 
   // 3. fixed-order reduction: rank 0 .. W-1, fp32, identical on every rank
   const T* mine = reinterpret_cast<const T*>(peers.stage[rank]) +

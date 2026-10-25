@@ -57,6 +57,19 @@ class SharedExperts(torch.nn.Module):
 
         self._mk_can_overlap_shared_experts = mk_can_overlap_shared_experts
 
+        # gfx10x (RDNA2, ROCm 7.14): a captured aux-stream fork/join replays
+        # as a cross-HSA-queue barrier pair; rarely (seen ~1 hang per 1-4 h of
+        # serving) the join waits on a completion signal left at -1
+        # (decremented twice), which wedges that rank's queues for good and
+        # the other TP ranks in their next collective. Run the shared experts
+        # inline while capturing a CUDA graph there; eager steps keep the
+        # overlap.
+        self._no_fork_in_capture = False
+        if current_platform.is_rocm():
+            from vllm.platforms.rocm import on_gfx10x
+
+            self._no_fork_in_capture = on_gfx10x()
+
         # Allow disabling of the separate shared experts stream for
         # debug purposes.
         # TODO: Remove this after more extensive testings with TP/DP
@@ -113,6 +126,9 @@ class SharedExperts(torch.nn.Module):
             and self._stream is not None
             and hidden_states.shape[0]
             <= envs.VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD
+            and not (
+                self._no_fork_in_capture and torch.cuda.is_current_stream_capturing()
+            )
         )
 
         if should_run_shared_in_aux_stream:

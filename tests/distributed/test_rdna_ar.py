@@ -145,11 +145,50 @@ def test_rdna_ar_defaults_off():
     assert 'os.getenv("VLLM_RDNA_AR", "0")' in envs
 
 
-def test_rdna_ar_check_noop_without_tp(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+def test_rdna_ar_check_noop_without_instances(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
     rdna_ar = _load_rdna_ar(monkeypatch, tmp_path)
-    rdna_ar._active = False
-    rdna_ar.rdna_ar_check()  # must not raise when there is no TP group
-    rdna_ar._active = False
+    assert rdna_ar._live == []
+    rdna_ar.rdna_ar_check()  # must not raise when no instance is active
+
+
+def test_rdna_ar_check_covers_every_live_instance(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """A wedge on the second instance (e.g. the EP group) fails the step too;
+    an already-disabled instance is skipped."""
+    rdna_ar = _load_rdna_ar(monkeypatch, tmp_path)
+
+    class _Ops:
+        def __init__(self, code: int) -> None:
+            self.code = code
+            self.calls = 0
+
+        def rdna_ar_timeout_info(self, handle: int) -> int:
+            self.calls += 1
+            return self.code
+
+    def make(handle: int, code: int, disabled: bool = False):
+        inst = rdna_ar.RdnaOneShotAllReduce.__new__(rdna_ar.RdnaOneShotAllReduce)
+        inst.disabled = disabled
+        inst.handle = handle
+        inst.rank = 2
+        inst.world_size = 4
+        inst._ops = _Ops(code)
+        return inst
+
+    tp, gone, ep = (
+        make(0, 0),
+        make(1, _pack(2, 3, 120_000, 5), disabled=True),
+        make(2, _pack(2, 1, 120_000, 9)),
+    )
+    rdna_ar._live.extend([tp, gone, ep])
+    with pytest.raises(RuntimeError, match="peer rank 1"):
+        rdna_ar.rdna_ar_check()
+    assert tp._ops.calls == 1 and gone._ops.calls == 0 and ep.disabled
+    rdna_ar.rdna_ar_check()  # the wedged instance is disabled now
+    assert tp._ops.calls == 2
 
 
 def test_check_writes_marker_and_raises(

@@ -51,6 +51,7 @@ CacheDType = Literal[
     "turboquant_k3v4_nc",
     "turboquant_3bit_nc",
     "int4_per_token_head",
+    "int4_fp16_block",
     "int8_per_token_head",
     "fp8_per_token_head",
     "nvfp4",
@@ -352,7 +353,12 @@ class CacheConfig:
     @field_validator("cache_dtype", mode="after")
     @classmethod
     def _validate_cache_dtype(cls, cache_dtype: CacheDType) -> CacheDType:
-        if kv_cache_uses_per_token_head_scales(cache_dtype):
+        if cache_dtype == "int4_fp16_block":
+            logger.info(
+                "Using int4_fp16_block KV cache with dynamic FP16 scales "
+                "per 32 head channels."
+            )
+        elif kv_cache_uses_per_token_head_scales(cache_dtype):
             logger.info(
                 "Using %s data type to store kv cache. It reduces the GPU "
                 "memory footprint and boosts the performance. "

@@ -146,3 +146,62 @@ def test_rdna_ar_late_peer(tmp_path, late_s, wait_ms):
         nprocs=2,
         join=True,
     )
+
+
+def _sticky_abort_worker(rank: int, world: int, port: int, cache_root: str) -> None:
+    """Rank 1 is late on one collective (rank 0 times out), then drops out.
+
+    Rank 0's later collectives must not wait the bound again (inside a graph
+    step that would add up to the engine timeout): they return at once with
+    out == in and leave the abort record for rdna_ar_check()."""
+    import time
+
+    os.environ.update(
+        MASTER_ADDR="127.0.0.1",
+        MASTER_PORT=str(port),
+        VLLM_CACHE_ROOT=cache_root,
+        VLLM_RDNA_AR_WAIT_MS="1000",
+    )
+    torch.accelerator.set_device_index(rank)
+    dist.init_process_group("gloo", rank=rank, world_size=world)
+    import vllm._custom_ops  # noqa: F401  (registers _rocm_C)
+    from vllm.distributed.device_communicators.rdna_all_reduce import (
+        RdnaOneShotAllReduce,
+    )
+
+    comm = RdnaOneShotAllReduce(dist.group.WORLD, torch.device("cuda", rank))
+    assert not comm.disabled
+    inp = torch.full((4096,), float(rank + 1), dtype=torch.float16, device="cuda")
+    comm.all_reduce(inp)
+    torch.accelerator.synchronize()
+    dist.barrier()
+    if rank == 1:
+        time.sleep(3.0)  # past rank 0's 1 s bound
+    comm.all_reduce(inp)
+    torch.accelerator.synchronize()
+    if rank == 0:
+        assert comm._ops.rdna_ar_timeout_info(comm.handle) != 0
+        t0 = time.monotonic()
+        outs = [comm.all_reduce(inp) for _ in range(5)]  # rank 1 never joins
+        torch.accelerator.synchronize()
+        elapsed = time.monotonic() - t0
+        assert elapsed < 0.5, f"later collectives re-waited: {elapsed:.2f} s"
+        for out in outs:
+            assert bool((out == inp).all())
+        with pytest.raises(RuntimeError, match="rdna_ar wedged"):
+            comm.check()
+    dist.barrier()
+    dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not (
+        torch.cuda.is_available()
+        and torch.accelerator.device_count() >= 2
+        and on_rdna2()
+    ),
+    reason="needs 2 gfx10x GPUs",
+)
+@pytest.mark.skipif(not _has_rdna_ar(), reason="rdna_ar op not built")
+def test_rdna_ar_abort_is_sticky(tmp_path):
+    mp.spawn(_sticky_abort_worker, args=(2, 29521, str(tmp_path)), nprocs=2, join=True)

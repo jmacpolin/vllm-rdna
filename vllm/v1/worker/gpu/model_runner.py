@@ -188,6 +188,11 @@ logger = init_logger(__name__)
 class GPUModelRunner(LoRAModelRunnerMixin):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         self.vllm_config = vllm_config
+        self._mono_mtp_failstop = False
+        if getattr(getattr(vllm_config, "kernel_config", None), "monokernel", False):
+            from vllm.models.qwen4_exp.amd.mono.rdna2.failstop import enabled
+
+            self._mono_mtp_failstop = enabled(vllm_config)
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
         self.compilation_config = vllm_config.compilation_config
@@ -930,7 +935,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             spec_hidden_states = hidden_states
             if hasattr(self.model, "get_mtp_target_hidden_states"):
                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
-                spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
+                if pre_hc_hidden_states is not None:
+                    spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]
             if isinstance(self.sampler, GPUWatermarkSampler):
                 self.speculator.prepare_watermarking(
                     self.sampler._get_contexts(input_batch.idx_mapping),
@@ -2284,7 +2290,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             spec_hidden_states = draft_hidden_states
             if hasattr(self.model, "get_mtp_target_hidden_states"):
                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
-                spec_hidden_states = pre_hc_hidden_states[: draft_hidden_states.size(0)]
+                if pre_hc_hidden_states is not None:
+                    spec_hidden_states = pre_hc_hidden_states[
+                        : draft_hidden_states.size(0)
+                    ]
             if isinstance(self.sampler, GPUWatermarkSampler):
                 self.speculator.prepare_watermarking(
                     self.sampler._get_contexts(input_batch.idx_mapping),
@@ -2311,6 +2320,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.adaptive_verification.record_confidences(
                     self.speculator.draft_token_confidence_probs, input_batch
                 )
+
+        if self._mono_mtp_failstop:
+            from vllm.models.qwen4_exp.amd.mono.rdna2.failstop import collect_tp_error
+
+            fault = collect_tp_error(self.device)
+            async_output.enqueue_mtp_fault(
+                fault, self.main_stream, self.output_copy_stream
+            )
 
         if phase_timer is not None:
             phase_timer.end("draft")

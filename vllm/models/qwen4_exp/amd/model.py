@@ -37,6 +37,7 @@ from vllm.model_executor.models.interfaces import (
     IsHybrid,
     MixtureOfExperts,
     MultiModalEmbeddings,
+    SupportsEagle3,
     SupportsLoRA,
     SupportsMRoPE,
     SupportsPP,
@@ -489,6 +490,7 @@ class Qwen4ExpModel(nn.Module):
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states"], intermediate_size
         )
+        self.aux_hidden_state_layers: tuple[int, ...] = ()
 
         self.hyper_connection_mixer: GatedResidual | None
         if get_pp_group().is_last_rank:
@@ -540,7 +542,7 @@ class Qwen4ExpModel(nn.Module):
         query_start_loc: torch.Tensor | None = None,
         ngram_context: torch.Tensor | None = None,
         deepstack_input_embeds: IntermediateTensors | None = None,
-    ) -> torch.Tensor | IntermediateTensors:
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -557,6 +559,7 @@ class Qwen4ExpModel(nn.Module):
         block_output = None
         injection = None
         last_layer = None
+        aux_hidden_states: list[torch.Tensor] = []
         for layer_idx, layer in islice(
             enumerate(self.layers), self.start_layer, self.end_layer
         ):
@@ -570,6 +573,17 @@ class Qwen4ExpModel(nn.Module):
                 query_start_loc=query_start_loc,
                 ngram_context=ngram_context,
             )
+            if layer_idx in self.aux_hidden_state_layers:
+                # DFlash2 was trained on each completed layer's four HC
+                # streams, averaged to the model's hidden width.
+                completed = layer.mlp_hyper_connection.combine(
+                    hidden_states, block_output, injection
+                )
+                aux_hidden_states.append(
+                    completed.unflatten(
+                        -1, (self.config.hc_count, self.config.hidden_size)
+                    ).mean(dim=-2)
+                )
             if (
                 os.environ.get("VLLM_LAYER_NAN_DEBUG") == "1"
                 and not torch.cuda.is_current_stream_capturing()
@@ -634,6 +648,10 @@ class Qwen4ExpModel(nn.Module):
             # this tensor is needed by the final mixer regardless).
             num_tokens = multi_hidden.shape[0]
             self._mtp_hidden_buffer[:num_tokens].copy_(multi_hidden)
+        if self.aux_hidden_state_layers:
+            if len(aux_hidden_states) != len(self.aux_hidden_state_layers):
+                raise RuntimeError("Qwen4Exp DFlash auxiliary layers were not captured")
+            return sample_hidden_states, aux_hidden_states
         return sample_hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -683,6 +701,7 @@ class Qwen4ExpModel(nn.Module):
 class Qwen4ExpForCausalLM(
     nn.Module,
     HasInnerState,
+    SupportsEagle3,
     SupportsLoRA,
     SupportsMRoPE,
     SupportsPP,
@@ -704,6 +723,11 @@ class Qwen4ExpForCausalLM(
         orig_to_new_prefix={"model.language_model.": "model."}
     )
     requires_raw_input_tokens = True
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        # The generic Eagle3 interface adds one to target_layer_ids. DFlash2
+        # expects the zero-based output of those exact layers instead.
+        self.model.aux_hidden_state_layers = tuple(layer - 1 for layer in layers)
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
@@ -934,6 +958,9 @@ class Qwen4ExpForConditionalGeneration(
     """Qwen3-VL vision tower backed by the Qwen4Exp language model."""
 
     requires_raw_input_tokens = True
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self.language_model.set_aux_hidden_state_layers(layers)
 
     packed_modules_mapping = Qwen3_5ForConditionalGeneration.packed_modules_mapping | {
         "input_mix_weight_down_block_inject": [

@@ -155,7 +155,39 @@ the only quantized GEMMs is the v1 shape. Anything else is a refuse.
 Also out of the kernel, and left on vLLM's layers:
 
 - The INT4 PLE n-gram table. Dest [#49](https://github.com/opengfx1030/vllm-rdna/pull/49) serves that table through the upstream PLE lookup (`VLLM_PLE_QUANT_DIR`). It is not a GEMM this kernel replaces.
-- MTP drafter experts produced by the quantizer bundled in [#82](https://github.com/opengfx1030/vllm-rdna/pull/82) (`tools/rdna/quant_mtp_experts.py`). The drafter stays on vLLM's layers through the phases in [plan.md](plan.md). #60397 leaves its DSpark draft layers off the main K1+K2 path ([#60397, scope](https://github.com/vllm-project/vllm/pull/60397)).
+- MTP drafter experts produced by the quantizer bundled in [#82](https://github.com/opengfx1030/vllm-rdna/pull/82) (`tools/rdna/quant_mtp_experts.py`). K2 still needs a supported symmetric W4A16 drafter; K1 can independently fuse compatible attention HyperConnections. #60397 leaves its DSpark draft layers off the main K1+K2 path ([#60397, scope](https://github.com/vllm-project/vllm/pull/60397)).
+
+### Experimental MTP drafter routing
+
+The `--monokernel` path can be opted into for a compatible Qwen4Exp MTP
+drafter with `additional_config.rocm_mono_decode.mtp_drafter=true`. This is
+separate from the target-model K1/K2 switches and defaults to off. Drafter K1
+and K2 have independent row caps (`mtp_k1_max_rows`, `mtp_k2_max_rows`, each
+clamped to 24). K1 setup depends only on compatible MLP and attention
+HyperConnection layouts, so it can run when the drafter's dense FFN is
+unsupported by K2. K2 still requires the supported symmetric W4A16 expert
+layout. Each part falls back to its existing vLLM modules when its own layout,
+dtype, row cap, or graph mode is unsupported. The drafter uses its own
+persistent-kernel workspace so its sticky error state cannot latch the target
+model's workspace.
+
+This is an experimental routing hook, not a mixed-prefill safety or performance
+qualification. The row cap only provides a modules fallback for large batches;
+it cannot rule out GPU scheduling delays on a small persistent-kernel launch.
+The K1/K2 timeout path writes NaNs to the caller-visible outputs and latches
+its workspace. Opt-in MTP launches enqueue a same-stream async memset of the
+small control header before the persistent kernel; this is captured as a graph
+memset node, not an extra HIP kernel launch. It clears a previous sticky error
+so a later request does not inherit it, while the current failed invocation
+still propagates NaNs. Enabling this knob requires
+`VLLM_RAISE_ON_LOGIT_NANS=1`; startup refuses the MTP route otherwise. This
+makes a detected NaN fail loudly instead of silently feeding corrupted logits
+to sampling, at the cost of the runner's logits NaN scan. Neither the reset nor
+the fail-stop proves that a barrier cannot time out or guarantees worker
+recovery. Keep the regular target MTP2 route unchanged. MTP MonoKernel is an
+experimental performance path until mixed-load fault/recovery and c1/c8
+serving comparisons show a win beyond run variance; the reset node's latency
+must be included in those measurements.
 
 Startup still applies the RFC default-deny list (PP, DP, EP, LoRA, KV
 connectors, sleep mode, and the rest named in the

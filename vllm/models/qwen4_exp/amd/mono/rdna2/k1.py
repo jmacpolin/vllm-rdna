@@ -48,6 +48,8 @@ def run(mono: MonoLayer, hidden_states, prev_out, prev_inj):
         OPTS.k2_num_wg,
         mono.eps_a,
         2000.0,
+        mono.is_mtp,
+        getattr(mono, "preserve_fault", False),
     )
     return res_out, out, inj_out
 
@@ -66,33 +68,40 @@ def _k1(
     hc = mono.layer.attn_hyper_connection
     m = hidden_states.shape[0]
     if not torch.cuda.is_current_stream_capturing():
-        mono.setup()
+        if mono.is_mtp:
+            mono.setup_k1()
+        else:
+            mono.setup()
     md = mode()
+    layout_ready = mono.k1_ready if mono.is_mtp else mono.ready
     use = (
         OPTS.k1
-        and mono.ready
+        and layout_ready
         and mono.hc_ok
-        and 0 < m <= OPTS.k1_max_rows
+        and 0 < m <= mono.k1_max_rows
         and hidden_states.dtype == torch.float16
         and md in MODES
     )
-    key = ("hc", m, md, use)
+    key = ("mtp-hc" if mono.is_mtp else "hc", m, md, use)
     if key not in LOGGED:
         LOGGED.add(key)
         logger.info(
-            "mono k1_rdna2: %d rows (%s) -> %s",
+            "mono %sk1_rdna2: %d rows (%s) -> %s",
+            "MTP " if mono.is_mtp else "",
             m,
             md,
             "K1 kernel" if use else "modules",
         )
-    debug.mark(3, hidden_states)
+    if not mono.is_mtp:
+        debug.mark(3, hidden_states)
     if use:
         out = run(mono, hidden_states, prev_out, prev_inj)
     elif prev_out is not None and prev_inj is not None:
         out = hc.combine_and_mix(hidden_states, prev_out, prev_inj)
     else:
         out = hc.mix(hidden_states)
-    debug.mark(4, hidden_states)
+    if not mono.is_mtp:
+        debug.mark(4, hidden_states)
     # a custom op may not return its inputs (mix() hands back hidden_states)
     ins = [t for t in (hidden_states, prev_out, prev_inj) if t is not None]
     return tuple(

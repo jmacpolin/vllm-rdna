@@ -112,7 +112,7 @@ if ((${#rdse_keys[@]})); then
     for _key in "${rdse_keys[@]}"; do
         case $_key in
             VLLM_* | NCCL_* | RCCL_* | HSA_* | TORCH_* | PYTORCH_* | OMP_* | PYTHON* | \
-                TOKENIZERS_* | FLASH_* | HIP_* | ROCM_* | GPU_* | TRITON_* | HF_* | TRANSFORMERS_*)
+                TOKENIZERS_* | FLASH_* | HIP_* | ROCM_* | RDNA_* | GPU_* | TRITON_* | HF_* | TRANSFORMERS_*)
                 if [[ -v $_key ]]; then export "${_key?}"; fi
                 ;;
         esac
@@ -255,8 +255,9 @@ rdse_tunableop_report() {
     # shellcheck source=tools/rdna2_028/tunableop_env.sh
     source "$source_dir/tools/rdna2_028/tunableop_env.sh"
     local lib=$ROCM_SDK_LIB/librocblas.so.5 requested=${TUNABLEOP_PROFILE:-}
+    local rows_root=${TUNABLEOP_ROOT:-$source_dir/tunableop}
     if [[ -n $requested ]]; then
-        if _tunableop_profiles "$source_dir/tunableop/profiles.json" |
+        if _tunableop_profiles "$rows_root/profiles.json" |
             awk -F'\t' -v n="$requested" '$1 == n { found = 1 } END { exit !found }'; then
             rdse_profile_line="$requested (requested; validated against the loaded library at launch)"
         else
@@ -268,7 +269,7 @@ rdse_tunableop_report() {
         local sha match
         sha=$(sha256sum -- "$lib")
         sha=${sha:0:12}
-        match=$(_tunableop_profiles "$source_dir/tunableop/profiles.json" |
+        match=$(_tunableop_profiles "$rows_root/profiles.json" |
             awk -F'\t' -v h="$sha" 'substr($3, 1, 12) == h { print $1; exit }')
         if [[ -n $match ]]; then
             rdse_profile_line="$match (auto-selected for librocblas.so.5 $sha)"
@@ -294,6 +295,9 @@ case $ATTN in
 esac
 
 rdna_mtp_args "${MTP:-0}"
+if [[ -n ${SPEC_CONFIG:-} ]]; then
+    spec_args=(--speculative-config "$SPEC_CONFIG")
+fi
 
 if [[ $EAGER == 1 ]]; then
     comp_config=""
@@ -378,6 +382,7 @@ RDSE_ENV_KEYS=(
     PYTHONPATH HF_HUB_OFFLINE TRANSFORMERS_OFFLINE
     HIP_VISIBLE_DEVICES VLLM_WORKER_MULTIPROC_METHOD GPU_MAX_HW_QUEUES ROCPROFILER_REGISTER_ENABLED
     VLLM_ROCM_USE_AITER VLLM_ROCM_USE_AITER_MOE VLLM_ROCM_MONO_DECODE
+    VLLM_RAISE_ON_LOGIT_NANS VLLM_SERVER_DEV_MODE
     TORCH_BLAS_PREFER_HIPBLASLT VLLM_BATCH_INVARIANT
     VLLM_CACHE_ROOT TRITON_CACHE_DIR TORCHINDUCTOR_CACHE_DIR TORCH_EXTENSIONS_DIR
     PYTORCH_TUNABLEOP_ENABLED PYTORCH_TUNABLEOP_TUNING
@@ -386,6 +391,7 @@ RDSE_ENV_KEYS=(
     VLLM_USE_RDNA2_FA VLLM_FA_RDNA2_GQA_DECODE VLLM_FA_RDNA2_GQA_MODE
     FLASH_ATTENTION_TRITON_AMD_ENABLE
     VLLM_USE_V2_MODEL_RUNNER VLLM_USE_AOT_COMPILE VLLM_DISABLE_COMPILE_CACHE
+    RDNA_DFLASH2_DRAFT_BF16
     VLLM_USE_BREAKABLE_CUDAGRAPH VLLM_RDNA_FUSED_HC VLLM_RDNA_HC_PREFILL_FUSED
     VLLM_GDN_HIP_PREFILL VLLM_RDNA_FUSED_SE
     VLLM_RDNA_DENSE_INT8 VLLM_RDNA_DENSE_INT8_ONLY VLLM_RDNA_DENSE_GEMV

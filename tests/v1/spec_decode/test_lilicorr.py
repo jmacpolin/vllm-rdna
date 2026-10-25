@@ -599,12 +599,15 @@ def owned_head_model(monkeypatch):
         )
         vllm_config = SimpleNamespace(
             speculative_config=SimpleNamespace(
-                draft_model_config=SimpleNamespace(hf_config=config),
+                draft_model_config=SimpleNamespace(
+                    hf_config=config, dtype=torch.float32
+                ),
                 draft_load_config=None,
                 attention_backend=None,
                 kv_cache_dtype=None,
             ),
             model_config=SimpleNamespace(
+                dtype=torch.float32,
                 get_total_num_hidden_layers=lambda: 0,
                 get_vocab_size=lambda: 64,
             ),

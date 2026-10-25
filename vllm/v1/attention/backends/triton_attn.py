@@ -371,6 +371,23 @@ class TritonAttentionBackend(AttentionBackend):
         return head_size >= 32
 
     @classmethod
+    def supports_combination(
+        cls,
+        head_size: int,
+        dtype: torch.dtype,
+        kv_cache_dtype: CacheDType | None,
+        block_size: int | None,
+        use_mla: bool,
+        has_sink: bool,
+        use_sparse: bool,
+        use_mm_prefix: bool,
+        device_capability: DeviceCapability,
+    ) -> str | None:
+        if kv_cache_dtype != "int4_fp16_block":
+            return None
+        return "int4_fp16_block requires the native RDNA_ATTN backend"
+
+    @classmethod
     def supports_mm_prefix(cls) -> bool:
         return True
 
@@ -545,6 +562,8 @@ class TritonAttentionImpl(AttentionImpl):
 
         self._kv_quant_mode = get_kv_quant_mode(kv_cache_dtype)
         self._is_per_token_head_quant = self._kv_quant_mode.is_per_token_head
+        if self._kv_quant_mode == KVQuantMode.INT4_FP16_BLOCK:
+            raise ValueError("int4_fp16_block requires the native RDNA_ATTN backend")
 
         # Enable tensor descriptors for Q/K/V load/store on platforms that
         # benefit from HW 2D block reads (Intel XPU).  The dead branch

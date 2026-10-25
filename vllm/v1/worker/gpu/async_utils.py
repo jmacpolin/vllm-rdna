@@ -133,6 +133,9 @@ class AsyncOutput(AsyncModelRunnerOutput):
         # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
         self.copy_event = torch.cuda.Event(blocking=True)
         self._has_fault: torch.Tensor | None = None
+        self._mtp_fault_cpu: torch.Tensor | None = None
+        self._mtp_fault_gpu: torch.Tensor | None = None
+        self._mtp_fault_event: torch.cuda.Event | None = None
 
         with stream(copy_stream, main_stream):
             copy_stream.wait_stream(main_stream)
@@ -170,8 +173,30 @@ class AsyncOutput(AsyncModelRunnerOutput):
                 self._has_fault = has_fault.to("cpu", non_blocking=True)
             self.copy_event.record(copy_stream)
 
+    def enqueue_mtp_fault(
+        self,
+        fault: torch.Tensor,
+        main_stream: torch.cuda.Stream,
+        copy_stream: torch.cuda.Stream,
+    ) -> None:
+        # Called after speculator.propose(); the earlier copy_event cannot
+        # cover kernels/collectives enqueued by the drafter.
+        self._mtp_fault_gpu = fault
+        self._mtp_fault_event = torch.cuda.Event(blocking=True)
+        with stream(copy_stream, main_stream):
+            copy_stream.wait_stream(main_stream)
+            self._mtp_fault_cpu = fault.to("cpu", non_blocking=True)
+            fault.record_stream(copy_stream)
+            self._mtp_fault_event.record(copy_stream)
+
     def get_output(self) -> ModelRunnerOutput:
         self.copy_event.synchronize()
+        if self._mtp_fault_event is not None:
+            self._mtp_fault_event.synchronize()
+            from vllm.models.qwen4_exp.amd.mono.rdna2.failstop import raise_if_error
+
+            assert self._mtp_fault_cpu is not None
+            raise_if_error(self._mtp_fault_cpu)
 
         # NOTE(woosuk): The following code is to ensure compatibility with
         # the existing model runner.

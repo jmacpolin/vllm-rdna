@@ -334,12 +334,28 @@ if TYPE_CHECKING:
     VLLM_RDNA_DENSE_INT8: bool = False
     VLLM_RDNA_FUSED_HC: bool = True
     VLLM_RDNA_FUSED_SE: bool = True
-    # Qwen4Exp / Qwen3.8-Flash-Next on gfx1030: opt-in HIP paths for the
-    # HC prefill kernels, QSA decode kernels, and PLE dilated short-conv.
-    # Default off (Triton) until the HIP ports are verified end-to-end.
-    VLLM_RDNA_HC_PREFILL_HIP: bool = False
-    VLLM_RDNA_QSA_HIP: bool = False
+    # Qwen4Exp / Qwen3.8-Flash-Next on gfx1030: HIP paths for the HC prefill
+    # and QSA kernels (default on: -6..8 % decode ITL and +3..7 % prefill
+    # without --monokernel, -2..4 % ITL with it, all serve gates), and the PLE
+    # dilated short-conv (default off, not yet end-to-end measured).
+    VLLM_RDNA_HC_PREFILL_HIP: bool = True
+    VLLM_RDNA_QSA_HIP: bool = True
+    # Which fused HIP QSA decode the non-monokernel Qwen4Exp path may use.
+    #   "auto"  - pick the kernel that matches the cache layout: the fp16
+    #             fused decode for an fp16 cache, the packed-int4 fused decode
+    #             for an int4_fp16_block cache, Triton otherwise.
+    #   "int4"  - require the packed-int4 fused decode; refuse if it is not
+    #             available rather than falling back (the Triton kernels
+    #             cannot read the packed record layout, and reading it as
+    #             the wrong format is silent corruption rather than a crash).
+    #   "off"   - never use the fused HIP QSA decode.
+    VLLM_RDNA_QSA_DECODE_MODE: str = "auto"
     VLLM_RDNA_PLE_CONV_HIP: bool = False
+    # Umbrella for the whole RDNA2 HIP kernel set (worker/sampler, top-k/top-p
+    # masking, QSA metadata, MTP conv1d + GDN spec-verify, unquantized MoE,
+    # vision pos-embed). Default on: gfx10x runs the HIP set; set 0 to fall
+    # back to the Triton kernels as before the port.
+    VLLM_RDNA_ALL_HIP: bool = True
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
@@ -2194,10 +2210,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_RDNA_FUSED_HC": lambda: os.getenv("VLLM_RDNA_FUSED_HC", "1") == "1",
     "VLLM_RDNA_FUSED_SE": lambda: os.getenv("VLLM_RDNA_FUSED_SE", "1") == "1",
     "VLLM_RDNA_HC_PREFILL_HIP": lambda: (
-        os.getenv("VLLM_RDNA_HC_PREFILL_HIP", "0") == "1"
+        os.getenv("VLLM_RDNA_HC_PREFILL_HIP", "1") == "1"
     ),
-    "VLLM_RDNA_QSA_HIP": lambda: os.getenv("VLLM_RDNA_QSA_HIP", "0") == "1",
+    "VLLM_RDNA_QSA_HIP": lambda: os.getenv("VLLM_RDNA_QSA_HIP", "1") == "1",
+    "VLLM_RDNA_QSA_DECODE_MODE": lambda: os.getenv("VLLM_RDNA_QSA_DECODE_MODE", "auto"),
     "VLLM_RDNA_PLE_CONV_HIP": lambda: os.getenv("VLLM_RDNA_PLE_CONV_HIP", "0") == "1",
+    "VLLM_RDNA_ALL_HIP": lambda: os.getenv("VLLM_RDNA_ALL_HIP", "1") == "1",
     # Log model inspection after loading.
     # If enabled, logs a transformers-style hierarchical view of the model
     # with quantization methods and attention backends.

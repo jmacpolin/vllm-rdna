@@ -272,14 +272,37 @@ def count_nans_per_row(logits: torch.Tensor) -> torch.Tensor:
     return logits.isnan().sum(dim=-1, dtype=torch.int32)
 
 
-def nans_to_dict(counts: list[int], req_id_to_index: dict[str, int]) -> dict[str, int]:
+def nans_to_dict(
+    counts: list[int],
+    req_id_to_index: dict[str, int],
+    num_draft_tokens: list[int] | tuple[int, ...] | None = None,
+) -> dict[str, int]:
     """Map per-row NaN counts onto request ids.
 
     Rows and requests need not correspond one-to-one, so requests without a
     row are reported as 0.
     """
+    if num_draft_tokens is None:
+        return {
+            req_id: int(counts[i]) if i < len(counts) else 0
+            for req_id, i in req_id_to_index.items()
+        }
+
+    # Speculative logits are packed in request order, with one verification
+    # row per draft token plus the bonus row. The CPU draft lengths already
+    # exist in SpecDecodeMetadata; reading its GPU cumsum would add a sync.
+    if len(num_draft_tokens) != len(req_id_to_index):
+        raise ValueError("Speculative NaN counts do not match the request batch")
+    expected_rows = sum(n + 1 for n in num_draft_tokens)
+    if len(counts) != expected_rows:
+        raise ValueError(
+            f"Expected {expected_rows} speculative logit rows, got {len(counts)}"
+        )
+    offsets = [0]
+    for n in num_draft_tokens:
+        offsets.append(offsets[-1] + n + 1)
     return {
-        req_id: int(counts[i]) if i < len(counts) else 0
+        req_id: sum(counts[offsets[i] : offsets[i + 1]])
         for req_id, i in req_id_to_index.items()
     }
 
@@ -296,6 +319,8 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         vocab_size: int,
         check_ep_fault: bool = False,
         num_nans: torch.Tensor | None = None,
+        num_draft_tokens: list[int] | None = None,
+        mtp_fault: torch.Tensor | None = None,
     ):
         self._model_runner_output = model_runner_output
         self._invalid_req_indices = invalid_req_indices
@@ -310,7 +335,16 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         self.vocab_size = vocab_size
         self._logprobs_tensors = logprobs_tensors
         self._num_nans = num_nans
+        # The next async step may replace its speculative metadata before
+        # get_output() runs. Keep this step's CPU lengths with the output.
+        self._num_draft_tokens = (
+            tuple(num_draft_tokens)
+            if num_nans is not None and num_draft_tokens is not None
+            else None
+        )
         self._has_fault: torch.Tensor | None = None
+        self._mtp_fault = mtp_fault
+        self._mtp_fault_cpu: torch.Tensor | None = None
 
         # Initiate the copy on a separate stream, but do not synchronize it.
         default_stream = torch.cuda.current_stream()
@@ -329,6 +363,9 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
                 if self._num_nans is not None
                 else None
             )
+            if mtp_fault is not None:
+                self._mtp_fault_cpu = mtp_fault.to("cpu", non_blocking=True)
+                mtp_fault.record_stream(async_output_copy_stream)
             if check_ep_fault:
                 has_fault = get_ep_all2all_manager().query_fault()
                 self._has_fault = has_fault.to("cpu", non_blocking=True)
@@ -341,6 +378,10 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         """
         max_gen_len = self.sampled_token_ids_cpu.shape[-1]
         self.async_copy_ready_event.synchronize()
+        if self._mtp_fault_cpu is not None:
+            from vllm.models.qwen4_exp.amd.mono.rdna2.failstop import raise_if_error
+
+            raise_if_error(self._mtp_fault_cpu)
 
         # Release the device tensors once the copy has completed.
         del self._logprobs_tensors
@@ -366,7 +407,9 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
 
         if self._num_nans_cpu is not None:
             output.num_nans_in_logits = nans_to_dict(
-                self._num_nans_cpu.tolist(), output.req_id_to_index
+                self._num_nans_cpu.tolist(),
+                output.req_id_to_index,
+                self._num_draft_tokens,
             )
             if envs.VLLM_RAISE_ON_LOGIT_NANS:
                 raise_if_nan_logits(output.num_nans_in_logits)
@@ -504,6 +547,11 @@ class GPUModelRunner(
         device: torch.device,
     ):
         self.vllm_config = vllm_config
+        self._mono_mtp_failstop = False
+        if getattr(getattr(vllm_config, "kernel_config", None), "monokernel", False):
+            from vllm.models.qwen4_exp.amd.mono.rdna2.failstop import enabled
+
+            self._mono_mtp_failstop = enabled(vllm_config)
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
         self.offload_config = vllm_config.offload_config
@@ -3912,6 +3960,7 @@ class GPUModelRunner(
         logits: torch.Tensor | None,
         hidden_states: torch.Tensor,
         num_scheduled_tokens: int,
+        spec_decode_metadata: SpecDecodeMetadata | None,
     ) -> tuple[
         dict[str, int],
         torch.Tensor | None,
@@ -3930,7 +3979,9 @@ class GPUModelRunner(
                 # stream rather than blocking here.
                 num_nans = None if logits is None else count_nans_per_row(logits)
             else:
-                num_nans_in_logits = self._get_nans_in_logits(logits)
+                num_nans_in_logits = self._get_nans_in_logits(
+                    logits, spec_decode_metadata
+                )
 
         num_reqs = self.input_batch.num_reqs
         discard_sampled_tokens_req_indices = np.nonzero(
@@ -4973,6 +5024,7 @@ class GPUModelRunner(
                 logits,
                 hidden_states,
                 scheduler_output.total_num_scheduled_tokens,
+                spec_decode_metadata,
             )
 
         if draft_after_bookkeeping:
@@ -4995,6 +5047,17 @@ class GPUModelRunner(
                     | Gemma4Proposer,
                 )
                 self.drafter.dummy_run(num_tokens=1)
+
+        mtp_fault = None
+        if self._mono_mtp_failstop:
+            from vllm.models.qwen4_exp.amd.mono.rdna2.failstop import (
+                collect_tp_error,
+                raise_if_error,
+            )
+
+            mtp_fault = collect_tp_error(self.device)
+            if not self.use_async_scheduling:
+                raise_if_error(mtp_fault.to("cpu"))
 
         # Finalize KV connector (wait_for_save + clear metadata) after
         # draft model runs. Deferred from target model forward to allow
@@ -5039,6 +5102,12 @@ class GPUModelRunner(
                 vocab_size=self.input_batch.vocab_size,
                 check_ep_fault=self.check_ep_fault,
                 num_nans=num_nans_device,
+                mtp_fault=mtp_fault,
+                num_draft_tokens=(
+                    spec_decode_metadata.num_draft_tokens
+                    if spec_decode_metadata is not None
+                    else None
+                ),
             )
         with record_function_or_nullcontext(
             "gpu_model_runner: set_async_sampled_token_ids"
@@ -5956,23 +6025,30 @@ class GPUModelRunner(
 
         return prompt_logprobs_dict
 
-    def _get_nans_in_logits(self, logits: torch.Tensor | None) -> dict[str, int]:
+    def _get_nans_in_logits(
+        self,
+        logits: torch.Tensor | None,
+        spec_decode_metadata: SpecDecodeMetadata | None = None,
+    ) -> dict[str, int]:
         """Count NaNs per request, reading the result back to the host.
 
         Only used under sync scheduling, The async path keeps the counts
         on device instead; see`AsyncGPUModelRunnerOutput`.
         """
-        try:
-            # Reporting per-request NaN counts requires them on the host; this
-            # path is opt-in diagnostics, so the D2H is intended.
-            with gpu_sync_allowed():
-                counts = [] if logits is None else count_nans_per_row(logits).tolist()
-            num_nans_in_logits = nans_to_dict(counts, self.input_batch.req_id_to_index)
-            if envs.VLLM_RAISE_ON_LOGIT_NANS:
-                raise_if_nan_logits(num_nans_in_logits)
-            return num_nans_in_logits
-        except IndexError:
-            return {}
+        # Reporting per-request NaN counts requires them on the host; this
+        # path is opt-in diagnostics, so the D2H is intended.
+        with gpu_sync_allowed():
+            counts = [] if logits is None else count_nans_per_row(logits).tolist()
+        num_nans_in_logits = nans_to_dict(
+            counts,
+            self.input_batch.req_id_to_index,
+            spec_decode_metadata.num_draft_tokens
+            if logits is not None and spec_decode_metadata is not None
+            else None,
+        )
+        if envs.VLLM_RAISE_ON_LOGIT_NANS:
+            raise_if_nan_logits(num_nans_in_logits)
+        return num_nans_in_logits
 
     @contextmanager
     def maybe_randomize_inputs(

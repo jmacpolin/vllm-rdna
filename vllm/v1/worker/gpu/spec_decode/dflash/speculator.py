@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import copy
+import os
 from typing import Any
 
 import torch
@@ -10,6 +11,7 @@ from vllm.config import VllmConfig, replace
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
@@ -23,6 +25,7 @@ from vllm.v1.worker.gpu.cp_utils import cp_local_slot
 from vllm.v1.worker.gpu.dp_utils import DPSyncState, dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
+from vllm.v1.worker.gpu.phase_timer import phase_timer
 from vllm.v1.worker.gpu.spec_decode.dflash.cudagraph import DFlashCudaGraphManager
 from vllm.v1.worker.gpu.spec_decode.dflash.utils import load_dflash_model
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
@@ -50,6 +53,17 @@ class DFlashSpeculator(DraftModelSpeculator):
             ),
         )
         super().__init__(vllm_config, device)
+
+        # BF16-trained DFlash2 residuals can overflow FP16 even when the
+        # target itself must run in FP16 on RDNA2. Keep only the draft in BF16.
+        if (
+            current_platform.is_rocm()
+            and os.environ.get("RDNA_DFLASH2_DRAFT_BF16") == "1"
+            and "DFlash2DraftModel" in self.draft_model_config.architectures
+        ):
+            self.draft_model_config.dtype = torch.bfloat16
+            self.dtype = torch.bfloat16
+            logger.info("Running the DFlash2 draft in BF16 with an FP16 target")
 
         self.hidden_states = torch.zeros(
             self.max_num_tokens, self.hidden_size, dtype=self.dtype, device=device
@@ -117,8 +131,11 @@ class DFlashSpeculator(DraftModelSpeculator):
     def attn_vllm_config(self) -> VllmConfig:
         # The draft's attention differs from the target's in causality.
         config = copy.copy(super().attn_vllm_config)
+        if self.draft_model_config.dtype != config.model_config.dtype:
+            config.model_config = self.draft_model_config
         config.attention_config = replace(
             self.vllm_config.attention_config,
+            backend=self.speculative_config.attention_backend,
             use_non_causal=self.requires_non_causal,
         )
         return config
@@ -381,6 +398,8 @@ class DFlashSpeculator(DraftModelSpeculator):
             hidden_states = last_hidden_states
         self.hidden_states[:num_target_tokens].copy_(hidden_states[:num_target_tokens])
         self.prepare_context_anchor(input_batch, num_rejected)
+        if phase_timer is not None and not dummy_run:
+            phase_timer.mark("dflash_context")
 
         if dummy_run and skip_attn_for_dummy_run:
             # Memory profiling path: block_tables / kv_cache_config are not initialized.
@@ -464,6 +483,8 @@ class DFlashSpeculator(DraftModelSpeculator):
         num_tokens_across_dp = (
             batch_sync.num_tokens_across_dp if batch_sync is not None else None
         )
+        if phase_timer is not None and not dummy_run:
+            phase_timer.mark("dflash_inputs")
 
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             # The graph stores the first num_context context rows.
@@ -482,6 +503,8 @@ class DFlashSpeculator(DraftModelSpeculator):
                 self._precompute_context_kv(num_context, num_target_tokens)
         else:
             self._precompute_context_kv(0, num_target_tokens, dummy_run)
+        if phase_timer is not None and not dummy_run:
+            phase_timer.mark("dflash_context_kv")
 
         # Rebuild the draft attention metadata even when replaying the FULL
         # graph so that any attention metadata builder state is updated.
@@ -501,6 +524,8 @@ class DFlashSpeculator(DraftModelSpeculator):
         # DFlash processes all speculative tokens in one forward pass,
         # so the real token count is num_query_tokens.
         self._prepare_eplb_forward(num_query_tokens)
+        if phase_timer is not None and not dummy_run:
+            phase_timer.mark("dflash_metadata")
 
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             assert self.query_cudagraph_manager is not None

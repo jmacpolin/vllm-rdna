@@ -7,6 +7,9 @@
 #
 # Results: ~/w4a8_runs/port-v031/serve-$TAG/{serve.log,probe.txt,bench-*.json,summary.txt}
 # CONC_PROBE=0 skips the greedy concurrency-correctness probe (on by default).
+# CONC_PROBE_ARGS="--no-ignore-eos" checks normal EOS instead of forced continuation.
+# RESET_PREFIX_CACHE=1 clears cached prompts before each benchmark cell;
+# requires VLLM_SERVER_DEV_MODE=1 on the benchmark server.
 # BENCH_EXTRA="--temperature 0" passes extra args to `vllm bench serve`. Without
 # it the server's generation_config sampling applies (e.g. temperature 1.0,
 # top_k 20, top_p 0.95 for Qwen3.8); greedy reference numbers need the flag.
@@ -53,8 +56,12 @@ esac
 SITE=$VENV/lib/python3.12/site-packages
 export LD_LIBRARY_PATH=$SITE/_rocm_sdk_libraries/lib:$SITE/_rocm_sdk_core/lib/host-math/lib:$SITE/_rocm_sdk_core/lib/rocm_sysdeps/lib:$SITE/_rocm_sdk_core/lib/core/lib:$SITE/torch/lib
 CACHE=${CACHE:-$HOME/w4a8_runs/port-v031/cache-$TAG}
-export VLLM_CACHE_ROOT=$CACHE/vllm TRITON_CACHE_DIR=$CACHE/triton
-export TORCHINDUCTOR_CACHE_DIR=$CACHE/inductor
+# VLLM_CACHE_ROOT stays per serve (it also holds the rdna_ar wedge marker);
+# the Triton / Inductor caches may be shared by serves of one tree (keyed by
+# kernel / graph hash) to skip recompiling at boot.
+export VLLM_CACHE_ROOT=$CACHE/vllm
+export TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-$CACHE/triton}
+export TORCHINDUCTOR_CACHE_DIR=${TORCHINDUCTOR_CACHE_DIR:-$CACHE/inductor}
 export ROCPROFILER_REGISTER_ENABLED=${ROCPROFILER_REGISTER_ENABLED:-0}  # bench clients too
 
 if [[ ${STALL_PROBE:-0} == 1 && ${STALL_ITER_LOG:-1} == 1 ]]; then
@@ -164,8 +171,10 @@ fi
 # Concurrency correctness: greedy outputs at c=N and under slot churn must
 # match the solo outputs. The c=1 probes above always run in slot 0.
 if [[ ${CONC_PROBE:-1} == 1 ]]; then
+    read -r -a conc_probe_args <<< "${CONC_PROBE_ARGS:-}"
     if "$VENV/bin/python" "$TREE/tools/rdna/port_v031/concurrency_probe.py" --url "$URL" \
-        --model "$SERVED" --verbose > "$OUT/concurrency.txt" 2>&1; then
+        --model "$SERVED" --verbose --save-results "$OUT/concurrency.json" \
+        "${conc_probe_args[@]}" > "$OUT/concurrency.txt" 2>&1; then
         log "CONCURRENCY PASS"
     else
         log "CONCURRENCY FAIL"
@@ -180,6 +189,24 @@ for cell in $CELLS; do
     (( conc == 1 )) && n=4
     [[ -n ${nreq:-} ]] && n=$nreq  # optional 4th field: request count
     name=bench-${in}x${out}-c${conc}
+    if [[ ${RESET_PREFIX_CACHE:-0} == 1 ]]; then
+        reset_ok=0
+        for attempt in 1 2 3 4 5; do
+            if curl -sf -X POST "http://127.0.0.1:$PORT/reset_prefix_cache" \
+                > "$OUT/reset-prefix-$name.json" && \
+                "$VENV/bin/python" -c 'import json,sys; sys.exit(json.load(open(sys.argv[1])).get("success") is not True)' \
+                "$OUT/reset-prefix-$name.json"; then
+                reset_ok=1
+                break
+            fi
+            sleep 1
+        done
+        if (( ! reset_ok )); then
+            log "PREFIX RESET FAILED before $name"
+            exit 1
+        fi
+        log "PREFIX RESET PASS before $name"
+    fi
     log "bench $name (n=$n)"
     "$VENV/bin/python" -m vllm.entrypoints.cli.main bench serve \
         --backend openai --endpoint /v1/completions \

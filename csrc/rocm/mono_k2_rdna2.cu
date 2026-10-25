@@ -23,9 +23,11 @@
 // they are deterministic. Phases are separated by a grid barrier on a
 // generation counter in global memory (agent-scope atomics, bounded wait, no
 // grid.sync). A timed-out wait writes a sticky {code, phase, wg} record and
-// every WG leaves; the record stays set until the host clears it, and a
-// launch that starts with it set writes NaN and exits (fail-stop: the caller
-// must check mono_k2_rdna2_error()).
+// each WG poisons caller-visible outputs before leaving; callers must fail
+// stop on NaN. Production MTP calls reset only count/gen on the same stream;
+// the error record stays sticky across K1/K2 calls until engine restart.
+// Explicit reset callers retain the full control-header clear by default.
+// The memset is a graph memset node, not an additional HIP kernel launch.
 //
 // Plain launch, one stream, capturable. The grid must be co-resident: the WG
 // count is the residency cap derived from the code object (2 WGs per CU,
@@ -127,9 +129,11 @@ struct Params {
   const half* se_w2;   // [H, Ise]
   const half* se_wg;   // [H]
   const uint32_t* w13;
+  const half* w13_dense;  // MTP-only row-major [E, 2I, H]
   const half* s13;
   const uint32_t* z13;
   const uint32_t* w2;
+  const half* w2_dense;  // MTP-only row-major [E, H, I]
   const half* s2;
   const uint32_t* z2;
   // workspace
@@ -146,8 +150,9 @@ struct Params {
   // shapes
   int M, H, R, ND, E, Ise, I, group, expert_base, zero_offset;
   float eps;
-  int prefetch;  // 1: waves 1..7 touch the next phase's weights while waiting
-  int hc_only;   // K1: stop after P3 (block_input written to out via bin)
+  int prefetch;   // 1: waves 1..7 touch the next phase's weights while waiting
+  int hc_only;    // K1: stop after P3 (block_input written to out via bin)
+  int dense_mtp;  // MTP-only unquantized FP16 experts
   // E1 GDN mode: K1, then the linear-attention decode of the layer.
   int gdn;
   const half* g_wq;     // in_proj_qkvz [4096, H]
@@ -223,6 +228,17 @@ __device__ __forceinline__ bool err_set(Ctrl* c) {
                            __HIP_MEMORY_SCOPE_AGENT) != 0;
 }
 
+__device__ __forceinline__ void poison_outputs(const Params& p, int wg, int tid,
+                                               int G) {
+  const half nan = __float2half(__int_as_float(0x7fc00000));
+  for (int i = wg * kThreads + tid; i < p.M * kHC * p.H; i += G * kThreads)
+    p.res_out[i] = nan;
+  for (int i = wg * kThreads + tid; i < p.M * kHC; i += G * kThreads)
+    p.inj_out[i] = nan;
+  for (int i = wg * kThreads + tid; i < p.M * p.H; i += G * kThreads)
+    p.out[i] = nan;
+}
+
 // Returns false if this WG must leave (timeout here or elsewhere).
 struct NoPrefetch {
   __device__ void operator()(int, uint32_t&, const volatile int*) const {}
@@ -233,8 +249,8 @@ struct NoPrefetch {
 // thread index among them), which touches the weights of this WG's tasks in
 // the next phase so they come from L2 / Infinity Cache instead of DRAM.
 template <typename F = NoPrefetch>
-__device__ bool grid_barrier(const Params& p, int phase, int* s_flag,
-                             F prefetch = F()) {
+__device__ __forceinline__ bool grid_barrier(const Params& p, int phase,
+                                             int* s_flag, F prefetch = F()) {
   __shared__ volatile int s_rel;  // set once the barrier has released
   __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
   if (threadIdx.x == 0) s_rel = 0;
@@ -321,6 +337,7 @@ __device__ bool grid_barrier(const Params& p, int phase, int* s_flag,
   }
   __syncthreads();
   __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+  if (!*s_flag) poison_outputs(p, blockIdx.x, threadIdx.x, gridDim.x);
   return *s_flag != 0;
 }
 
@@ -743,6 +760,93 @@ __device__ __forceinline__ int tiled_kslice(int base, int K8, int kmax,
   return kp;
 }
 
+// Dense MTP expert dot products keep checkpoint row-major weights. Each wave
+// owns one output row and reduces K; the same weight vector is reused across
+// four routed token rows before loading the next vector.
+template <int MT, typename RowOf>
+__device__ __forceinline__ void dense_dot_rows(const half* __restrict__ w,
+                                               int K, RowOf row_of, int rows,
+                                               int lane, float (&acc)[MT]) {
+  const uint4* wr = reinterpret_cast<const uint4*>(w);
+#pragma unroll
+  for (int m = 0; m < MT; m++) acc[m] = 0.f;
+  for (int k = lane * 8; k < K; k += 32 * 8) {
+    const uint4 wq = wr[k / 8];
+    const half2* wh = reinterpret_cast<const half2*>(&wq);
+#pragma unroll
+    for (int m = 0; m < MT; m++) {
+      if (m < rows) {
+        const uint4 xq = reinterpret_cast<const uint4*>(row_of(m))[k / 8];
+        const half2* xh = reinterpret_cast<const half2*>(&xq);
+        float v = acc[m];
+#pragma unroll
+        for (int q = 0; q < 4; q++)
+          v = __builtin_amdgcn_fdot2(wh[q], xh[q], v, false);
+        acc[m] = v;
+      }
+    }
+  }
+  wave_sum<MT>(acc);
+}
+
+template <int MT, typename RowOf>
+__device__ __forceinline__ void dense_dot2_rows(const half* __restrict__ wg,
+                                                const half* __restrict__ wu,
+                                                int K, RowOf row_of, int rows,
+                                                int lane, float (&g)[MT],
+                                                float (&u)[MT]) {
+  const uint4* wgp = reinterpret_cast<const uint4*>(wg);
+  const uint4* wup = reinterpret_cast<const uint4*>(wu);
+#pragma unroll
+  for (int m = 0; m < MT; m++) g[m] = u[m] = 0.f;
+  for (int k = lane * 8; k < K; k += 32 * 8) {
+    const uint4 wgq = wgp[k / 8], wuq = wup[k / 8];
+    const half2* gh = reinterpret_cast<const half2*>(&wgq);
+    const half2* uh = reinterpret_cast<const half2*>(&wuq);
+#pragma unroll
+    for (int m = 0; m < MT; m++) {
+      if (m < rows) {
+        const uint4 xq = reinterpret_cast<const uint4*>(row_of(m))[k / 8];
+        const half2* xh = reinterpret_cast<const half2*>(&xq);
+        float gv = g[m], uv = u[m];
+#pragma unroll
+        for (int q = 0; q < 4; q++) {
+          gv = __builtin_amdgcn_fdot2(gh[q], xh[q], gv, false);
+          uv = __builtin_amdgcn_fdot2(uh[q], xh[q], uv, false);
+        }
+        g[m] = gv;
+        u[m] = uv;
+      }
+    }
+  }
+  wave_sum<MT>(g);
+  wave_sum<MT>(u);
+}
+
+// Match native dense HIP rounding: gu is dead after P5c's existing
+// phase5 barrier and is reused as [pair,H] half slots in P6. Each P7 thread
+// owns one(m,h), so only it consumes/clears all10 slots for that output.
+__device__ __forceinline__ half
+dense_native_output_rounding(const Params& p, const int* selected_ids, int i) {
+  static_assert(sizeof(Fx) * 2 * 640 >= sizeof(half) * 2560,
+                "dense [pair,H] slots must fit existing [pair,2I] Fx scratch");
+  const int m = i / p.H, h = i % p.H;
+  half* const slots = reinterpret_cast<half*>(p.gu);
+  float routed = 0.f;
+#pragma unroll
+  for (int k = 0; k < kTopK; ++k) {
+    const int pi = m * kTopK + k;
+    const int le = selected_ids[pi] - p.expert_base;
+    const size_t address = (size_t)pi * p.H + h;
+    if (le >= 0 && le < kLocalE) routed += __half2float(slots[address]);
+    // Consume/clear only this exact pair-column, including nonlocal slots.
+    slots[address] = __float2half_rn(0.f);
+  }
+  const half routed16 = __float2half_rn(routed);
+  const half shared16 = __float2half_rn(p.acc[i]);
+  return __float2half_rn(__half2float(shared16) + __half2float(routed16));
+}
+
 // int4 column dequant constants for one (expert, group, column).
 __device__ __forceinline__ void q4_prep(const uint32_t* z, const half* s,
                                         int group, int N, int col, int zoff,
@@ -816,11 +920,10 @@ __global__ void __launch_bounds__(kThreads)
   const int G = gridDim.x, wg = blockIdx.x;
   const int gw = wg * kWaves + wave, GW = G * kWaves;
   const int M = p.M, H = p.H, HCH = kHC * p.H, R = p.R, ND = p.ND;
+  const bool dense_native_rounding = p.dense_mtp && H == 2560 && p.I == 640;
 
   if (err_set(p.ctrl)) {  // fail-stop: a previous launch timed out
-    for (int i = wg * kThreads + tid; i < M * H; i += G * kThreads)
-      p.out[i] =
-          __float2half(__int_as_float(0x7fc00000));  // NaN, not stale data
+    poison_outputs(p, wg, tid, G);
     return;
   }
   unsigned long long* const sc =
@@ -837,6 +940,13 @@ __global__ void __launch_bounds__(kThreads)
   }
 
   // ---------------- P1: combine + grouped RMSNorm; zero scratch
+  if (dense_native_rounding) {
+    // Full capacity, not only active M: recover gu lifetime after a dense
+    // reset.
+    for (int i = wg * kThreads + tid; i < kMaxM * kTopK * 2 * p.I;
+         i += G * kThreads)
+      p.gu[i].v = 0;
+  }
   for (int i = wg * kThreads + tid; i < M * ND; i += G * kThreads)
     p.dai[i] = 0.f;
   for (int i = wg * kThreads + tid; i < M * H; i += G * kThreads)
@@ -1431,6 +1541,8 @@ __global__ void __launch_bounds__(kThreads)
     // fixed point, so the order of pairs does not change any result).
     // M > GTOPK_MIN: one wave of the grid per row (instead of every WG doing
     // all rows on its 8 waves), published through the workspace + one barrier.
+    const bool quantized_router_half_boundary =
+        !p.dense_mtp && H == 2560 && p.E == 512 && p.I == 640;
     const bool gtopk = M > MONO_FFN_GTOPK_MIN;
     for (int m = gtopk ? gw : wave; m < M; m += gtopk ? GW : kWaves) {
       int* const o_tid = gtopk ? p.ctrl->topk_id : s_tid;
@@ -1442,7 +1554,11 @@ __global__ void __launch_bounds__(kThreads)
 #pragma unroll
       for (int j = 0; j < 16; j++) {
         const int e = lane + 32 * j;
-        v[j] = e < p.E ? (float)lg[e] : -INFINITY;
+        v[j] = e < p.E
+                   ? ((dense_native_rounding || quantized_router_half_boundary)
+                          ? __half2float(__float2half_rn((float)lg[e]))
+                          : (float)lg[e])
+                   : -INFINITY;
         mx = fmaxf(mx, v[j]);
         const unsigned b = __float_as_uint(v[j]);
         key[j] = e < p.E ? ((b & 0x80000000u) ? ~b : (b | 0x80000000u)) : 0u;
@@ -1484,7 +1600,26 @@ __global__ void __launch_bounds__(kThreads)
         sel_sum += __shfl_xor(sel_sum, off);
       __builtin_amdgcn_wave_barrier();
       __builtin_amdgcn_fence(__ATOMIC_ACQ_REL, "agent");
-      if (lane < kTopK) o_tw[m * kTopK + lane] *= 1.f / sel_sum;
+      if (dense_native_rounding) {
+        if (lane < kTopK) {
+          // Register snapshot before any write; all10 selected lanes remain
+          // active for every shuffle. Rank by raw logit, not rounded weights.
+          const int id = o_tid[m * kTopK + lane];
+          const float weight = o_tw[m * kTopK + lane];
+          const float score = __half2float(__float2half_rn((float)lg[id]));
+          int rank = 0;
+#pragma unroll
+          for (int k = 0; k < kTopK; ++k) {
+            const float other = __shfl(score, k);
+            const int other_id = __shfl(id, k);
+            rank += other > score || (other == score && other_id < id);
+          }
+          o_tid[m * kTopK + rank] = id;
+          o_tw[m * kTopK + rank] = weight * (1.f / sel_sum);
+        }
+      } else {
+        if (lane < kTopK) o_tw[m * kTopK + lane] *= 1.f / sel_sum;
+      }
     }
     if (gtopk) {
       if (!grid_barrier(p, 7, &s_flag)) return;
@@ -1554,7 +1689,45 @@ __global__ void __launch_bounds__(kThreads)
     // shared-expert down rows. P5c applies SwiGLU after one more barrier.
     {
       const int I = p.I, N13 = 2 * I, K8 = H / 8, g8 = p.group / 8;
-      {
+      if (p.dense_mtp) {
+        // The checkpoint stores [gate; up] as 2*I rows, but the scratch is
+        // packed as [gate(I), up(I)] for each routed pair.
+        const int ntile = (I + 7) / 8;
+        for (int t = wg; t < nused * ntile; t += G) {
+          const int u = t / ntile, nt = t % ntile;
+          const int e = s_used[u], col = nt * 8 + wave;
+          const half* we = p.w13_dense + (size_t)e * N13 * H;
+          for (int r0 = 0; r0 < s_ucnt[u]; r0 += 4) {
+            const int nr = min(4, s_ucnt[u] - r0);
+            auto row_of = [&](int r) {
+              const int pi = s_urow[u * kMaxM + r0 + r];
+              return p.bin + (size_t)(pi / kTopK) * H;
+            };
+            float g[4], up[4];
+            dense_dot2_rows<4>(we + (size_t)col * H, we + (size_t)(I + col) * H,
+                               H, row_of, nr, lane, g, up);
+            if (lane == 0) {
+#pragma unroll
+              for (int r = 0; r < 4; r++) {
+                if (r < nr) {
+                  const int pi = s_urow[u * kMaxM + r0 + r];
+                  if (dense_native_rounding) {
+                    // Keep original FP32 bits without intermediate half/Fx
+                    // rounding.
+                    p.gu[(size_t)pi * N13 + col].v =
+                        (long long)__float_as_uint(g[r]);
+                    p.gu[(size_t)pi * N13 + I + col].v =
+                        (long long)__float_as_uint(up[r]);
+                  } else {
+                    p.gu[(size_t)pi * N13 + col] = g[r];
+                    p.gu[(size_t)pi * N13 + I + col] = up[r];
+                  }
+                }
+              }
+            }
+          }
+        }
+      } else {
         constexpr int TN = kThreads * 4;
         const int ntile = (N13 + TN - 1) / TN;
         const int tb = nused * ntile;
@@ -1633,13 +1806,22 @@ __global__ void __launch_bounds__(kThreads)
         const int le = s_tid[pi] - p.expert_base;
         if (le < 0 || le >= kLocalE) continue;
         Fx* gp = p.gu + (size_t)pi * N13;
-        const half g16 = __float2half(gp[j]);
-        const half u16 = __float2half(gp[I + j]);
-        gp[j].v = 0;
-        gp[I + j].v = 0;
-        const half sg = __float2half(silu_f(__half2float(g16)));
-        p.act[(size_t)pi * I + j] =
-            __float2half(__half2float(sg) * __half2float(u16));
+        if (dense_native_rounding) {
+          const float gate = __uint_as_float((unsigned)gp[j].v);
+          const float up = __uint_as_float((unsigned)gp[I + j].v);
+          gp[j].v = 0;
+          gp[I + j].v = 0;
+          const float activated = gate / (1.0f + expf(-gate));
+          p.act[(size_t)pi * I + j] = __float2half_rn(activated * up);
+        } else {
+          const half g16 = __float2half(gp[j]);
+          const half u16 = __float2half(gp[I + j]);
+          gp[j].v = 0;
+          gp[I + j].v = 0;
+          const half sg = __float2half(silu_f(__half2float(g16)));
+          p.act[(size_t)pi * I + j] =
+              __float2half(__half2float(sg) * __half2float(u16));
+        }
       }
     }
     {
@@ -1657,7 +1839,11 @@ __global__ void __launch_bounds__(kThreads)
           }
         }
       };
-      if (!grid_barrier(p, 5, &s_flag, pf)) return;
+      if (p.dense_mtp) {
+        if (!grid_barrier(p, 5, &s_flag)) return;
+      } else if (!grid_barrier(p, 5, &s_flag, pf)) {
+        return;
+      }
     }
     if (wg == 0 && tid == 0) p.ctrl->ts[5] = wall_clock64();
 
@@ -1666,7 +1852,40 @@ __global__ void __launch_bounds__(kThreads)
     // acc.
     {
       const int I = p.I, K8 = I / 8, g8 = p.group / 8;
-      {
+      if (p.dense_mtp) {
+        const int ntile = (H + 7) / 8;
+        for (int t = wg; t < nused * ntile; t += G) {
+          const int u = t / ntile, nt = t % ntile;
+          const int e = s_used[u], col = nt * 8 + wave;
+          const half* we = p.w2_dense + (size_t)e * H * I + (size_t)col * I;
+          for (int r0 = 0; r0 < s_ucnt[u]; r0 += 4) {
+            const int nr = min(4, s_ucnt[u] - r0);
+            auto row_of = [&](int r) {
+              const int pi = s_urow[u * kMaxM + r0 + r];
+              return p.act + (size_t)pi * I;
+            };
+            float a[4];
+            dense_dot_rows<4>(we, I, row_of, nr, lane, a);
+            if (lane == 0) {
+#pragma unroll
+              for (int r = 0; r < 4; r++) {
+                if (r < nr) {
+                  const int pi = s_urow[u * kMaxM + r0 + r];
+                  if (dense_native_rounding) {
+                    half* const slots = reinterpret_cast<half*>(p.gu);
+                    slots[(size_t)pi * H + col] =
+                        __float2half_rn(a[r] * s_tw[pi]);
+                  } else {
+                    Fx* dst = p.acc + (size_t)(pi / kTopK) * H + col;
+                    const half down16 = __float2half(a[r]);
+                    atomicAdd(dst, __half2float(down16) * s_tw[pi]);
+                  }
+                }
+              }
+            }
+          }
+        }
+      } else {
         constexpr int TN = kThreads * 4;
         const int ntile = (H + TN - 1) / TN;
         const int tb = nused * ntile;
@@ -1712,7 +1931,9 @@ __global__ void __launch_bounds__(kThreads)
     const int par = seq & 1;
     const long long slot = p.ar.max_bytes / 2;
     for (int i = wg * kThreads + tid; i < M * H; i += G * kThreads) {
-      const half h = __float2half(p.acc[i]);
+      const half h = dense_native_rounding
+                         ? dense_native_output_rounding(p, s_tid, i)
+                         : __float2half(p.acc[i]);
       p.out[i] = h;
       for (int k = 1; k < W; k++) {
         const int j = (me + k) % W;
@@ -1759,8 +1980,10 @@ __global__ void __launch_bounds__(kThreads)
       s_ar_ok = ok;
     }
     __syncthreads();
-    if (wg == 0 && !s_ar_ok)
+    if (wg == 0 && !s_ar_ok) {
+      poison_outputs(p, wg, tid, G);
       return;  // sticky error set: the others leave the barrier
+    }
     if (!grid_barrier(p, 8, &s_flag)) return;
     const half* stage = reinterpret_cast<const half*>(p.ar.peers.stage[me]) +
                         (long long)par * W * slot;
@@ -1772,7 +1995,9 @@ __global__ void __launch_bounds__(kThreads)
     }
   } else {
     for (int i = wg * kThreads + tid; i < M * H; i += G * kThreads)
-      p.out[i] = __float2half(p.acc[i]);
+      p.out[i] = dense_native_rounding
+                     ? dense_native_output_rounding(p, s_tid, i)
+                     : __float2half(p.acc[i]);
   }
   if (wg == 0 && tid == 0) {
     p.ctrl->ts[7] = wall_clock64();
@@ -1906,19 +2131,18 @@ struct GdnArgs {
   int64_t sigmoid;
 };
 
-static void mono_launch(const torch::Tensor& res, const torch::Tensor& blk,
-                        const torch::Tensor& inj, const torch::Tensor& norm_w,
-                        const torch::Tensor& wd, const torch::Tensor& wu,
-                        const torch::Tensor* wr, const torch::Tensor* se_w1,
-                        const torch::Tensor* se_w2, const torch::Tensor* se_wg,
-                        const torch::Tensor* w13, const torch::Tensor* s13,
-                        const torch::Tensor* z13, const torch::Tensor* w2,
-                        const torch::Tensor* s2, const torch::Tensor* z2,
-                        torch::Tensor& res_out, torch::Tensor& inj_out,
-                        torch::Tensor& out, torch::Tensor& workspace,
-                        int64_t expert_base, int64_t zero_offset,
-                        int64_t num_wg, double eps, double timeout_ms,
-                        const GdnArgs* gdn = nullptr) {
+static void mono_launch(
+    const torch::Tensor& res, const torch::Tensor& blk,
+    const torch::Tensor& inj, const torch::Tensor& norm_w,
+    const torch::Tensor& wd, const torch::Tensor& wu, const torch::Tensor* wr,
+    const torch::Tensor* se_w1, const torch::Tensor* se_w2,
+    const torch::Tensor* se_wg, const torch::Tensor* w13,
+    const torch::Tensor* s13, const torch::Tensor* z13, const torch::Tensor* w2,
+    const torch::Tensor* s2, const torch::Tensor* z2, torch::Tensor& res_out,
+    torch::Tensor& inj_out, torch::Tensor& out, torch::Tensor& workspace,
+    int64_t expert_base, int64_t zero_offset, int64_t num_wg, double eps,
+    double timeout_ms, const GdnArgs* gdn = nullptr, bool reset_control = false,
+    bool dense_mtp = false, bool preserve_fault = false) {
   using namespace mono_ffn;
   const bool hc_only = wr == nullptr && gdn == nullptr;  // K1 only
   const int M = res.size(0);
@@ -1933,15 +2157,31 @@ static void mono_launch(const torch::Tensor& res, const torch::Tensor& blk,
   const bool ffn = wr != nullptr;
   const int E = !ffn ? 512 : wr->size(0);
   const int Ise = !ffn ? 160 : se_w2->size(1);
-  const int I = !ffn ? 640 : w2->size(1) * 8;
-  const int group = !ffn ? 128 : H / s13->size(1);
+  const int I = !ffn ? 640 : (dense_mtp ? w2->size(2) : w2->size(1) * 8);
+  const int group = !ffn ? 128 : (dense_mtp ? 128 : H / s13->size(1));
   TORCH_CHECK(R == 320 || R <= 320, "mono_ffn: lora rank <= 320");
   if (ffn) {
+    TORCH_CHECK(!dense_mtp || reset_control,
+                "mono_ffn: dense expert branch is MTP-only");
     TORCH_CHECK(E <= 512 && w13->size(0) <= kLocalE,
                 "mono_ffn: E <= 512, local <= 128");
-    TORCH_CHECK(w13->size(2) == 2 * I && w13->size(1) * 8 == H,
-                "mono_ffn: w13 shape");
-    TORCH_CHECK(Ise <= 160 && Ise % 8 == 0, "mono_ffn: shared-expert size");
+    if (dense_mtp) {
+      TORCH_CHECK(w13->scalar_type() == at::kHalf && w13->dim() == 3 &&
+                      w13->is_contiguous() && w13->size(0) == kLocalE &&
+                      w13->size(1) == 2 * I && w13->size(2) == H &&
+                      w2->scalar_type() == at::kHalf && w2->dim() == 3 &&
+                      w2->is_contiguous() && w2->size(0) == w13->size(0) &&
+                      w2->size(1) == H && w2->size(2) == I && H == 2560 &&
+                      I == 640 && w13->device() == res.device() &&
+                      w2->device() == res.device(),
+                  "mono_ffn: dense MTP w13/w2 shapes or dtype");
+      TORCH_CHECK(I % 8 == 0 && H % 8 == 0, "mono_ffn: dense MTP alignment");
+    } else {
+      TORCH_CHECK(w13->size(2) == 2 * I && w13->size(1) * 8 == H,
+                  "mono_ffn: w13 shape");
+    }
+    TORCH_CHECK((dense_mtp ? Ise == 160 : Ise <= 160) && Ise % 8 == 0,
+                "mono_ffn: shared-expert size");
     TORCH_CHECK(H % 128 == 0 && I % 64 == 0 && group % 8 == 0,
                 "mono_ffn: alignment");
   }
@@ -1966,12 +2206,18 @@ static void mono_launch(const torch::Tensor& res, const torch::Tensor& blk,
     p.se_w1 = reinterpret_cast<const half*>(se_w1->data_ptr());
     p.se_w2 = reinterpret_cast<const half*>(se_w2->data_ptr());
     p.se_wg = reinterpret_cast<const half*>(se_wg->data_ptr());
-    p.w13 = reinterpret_cast<const uint32_t*>(w13->data_ptr());
-    p.s13 = reinterpret_cast<const half*>(s13->data_ptr());
-    p.z13 = reinterpret_cast<const uint32_t*>(z13->data_ptr());
-    p.w2 = reinterpret_cast<const uint32_t*>(w2->data_ptr());
-    p.s2 = reinterpret_cast<const half*>(s2->data_ptr());
-    p.z2 = reinterpret_cast<const uint32_t*>(z2->data_ptr());
+    if (dense_mtp) {
+      p.w13_dense = reinterpret_cast<const half*>(w13->data_ptr());
+      p.w2_dense = reinterpret_cast<const half*>(w2->data_ptr());
+      p.dense_mtp = 1;
+    } else {
+      p.w13 = reinterpret_cast<const uint32_t*>(w13->data_ptr());
+      p.s13 = reinterpret_cast<const half*>(s13->data_ptr());
+      p.z13 = reinterpret_cast<const uint32_t*>(z13->data_ptr());
+      p.w2 = reinterpret_cast<const uint32_t*>(w2->data_ptr());
+      p.s2 = reinterpret_cast<const half*>(s2->data_ptr());
+      p.z2 = reinterpret_cast<const uint32_t*>(z2->data_ptr());
+    }
   }
   p.hc_only = hc_only ? 1 : 0;
   TORCH_CHECK(gdn == nullptr || MONO_FFN_E1A,
@@ -2088,6 +2334,15 @@ static void mono_launch(const torch::Tensor& res, const torch::Tensor& blk,
                         res.get_device());
   p.timeout_ticks = (unsigned long long)(timeout_ms * (khz > 0 ? khz : 100000));
   auto stream = at::cuda::getCurrentCUDAStream();
+  TORCH_CHECK(!preserve_fault || reset_control,
+              "mono_ffn: preserve_fault requires reset_control");
+  if (reset_control) {
+    const hipError_t reset_err = hipMemsetAsync(
+        p.ctrl, 0,
+        preserve_fault ? offsetof(Ctrl, err_code) : offsetof(Ctrl, ts), stream);
+    TORCH_CHECK(reset_err == hipSuccess, "mono_ffn: MTP control reset failed: ",
+                hipGetErrorString(reset_err));
+  }
   auto launch = [&](auto kern, int slot) {
     // The grid barrier needs every WG resident. hipOccupancy* counts WGPs on
     // gfx10 and under-reports by 2x (P0 probe), so derive the per-CU limit
@@ -2138,10 +2393,12 @@ void mono_k2_rdna2(const torch::Tensor& res, const torch::Tensor& blk,
                    torch::Tensor& res_out, torch::Tensor& inj_out,
                    torch::Tensor& out, torch::Tensor& workspace,
                    int64_t expert_base, int64_t zero_offset, int64_t num_wg,
-                   double eps, double timeout_ms) {
+                   double eps, double timeout_ms, bool reset_control,
+                   bool dense_mtp, bool preserve_fault) {
   mono_launch(res, blk, inj, norm_w, wd, wu, &wr, &se_w1, &se_w2, &se_wg, &w13,
               &s13, &z13, &w2, &s2, &z2, res_out, inj_out, out, workspace,
-              expert_base, zero_offset, num_wg, eps, timeout_ms);
+              expert_base, zero_offset, num_wg, eps, timeout_ms, nullptr,
+              reset_control, dense_mtp, preserve_fault);
 }
 
 // E1: K1 + the GDN (linear-attention) decode of one layer in one launch.
@@ -2175,10 +2432,12 @@ void mono_k1_rdna2(const torch::Tensor& res, const torch::Tensor& blk,
                    const torch::Tensor& wd, const torch::Tensor& wu,
                    torch::Tensor& res_out, torch::Tensor& inj_out,
                    torch::Tensor& out, torch::Tensor& workspace, int64_t num_wg,
-                   double eps, double timeout_ms) {
+                   double eps, double timeout_ms, bool reset_control,
+                   bool preserve_fault) {
   mono_launch(res, blk, inj, norm_w, wd, wu, nullptr, nullptr, nullptr, nullptr,
               nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, res_out,
-              inj_out, out, workspace, 0, 1, num_wg, eps, timeout_ms);
+              inj_out, out, workspace, 0, 1, num_wg, eps, timeout_ms, nullptr,
+              reset_control, false, preserve_fault);
 }
 
 // Sticky error record of a workspace: [code, phase, wg] (int32, CPU tensor).

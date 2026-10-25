@@ -21,6 +21,9 @@ class Options:
     k1_max_rows: int = 24
     k2: bool = True  # decode FFN block in one persistent launch
     k2_max_rows: int = 8  # width gate: K2 up to this many rows, modules above
+    mtp_drafter: bool = False  # opt-in: use K1/K2 for supported MTP MoE layers
+    mtp_k1_max_rows: int = 24
+    mtp_k2_max_rows: int = 24
     k2_modes: str = "full,piecewise,eager"
     k2_num_wg: int = 0  # 0: residency cap
     k2_sleep: int = 0  # tuning: barrier poll backoff

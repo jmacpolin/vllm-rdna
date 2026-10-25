@@ -4,7 +4,8 @@
 
 from __future__ import annotations
 
-from typing import ClassVar, cast
+from dataclasses import replace
+from typing import ClassVar, NamedTuple, cast
 
 import torch
 from torch import nn
@@ -49,15 +50,70 @@ from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionMetadata,
     FlashAttentionMetadataBuilder,
 )
+from vllm.v1.attention.ops.int4_fp16_kv_layout import (
+    INT4_FP16_BLOCK,
+    int4_fp16_cache_view,
+    int4_fp16_read_views,
+    int4_fp16_record_bytes,
+)
 from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
     FullAttentionSpec,
     KVCacheSpec,
+    KVQuantMode,
     get_kv_quant_mode,
 )
 
 from ..common.qsa_cache import QSAForwardMetadata
 from . import model
 from .indexer_qsa import QSAIndexer
+
+
+class QsaMainKvLayout(NamedTuple):
+    """How this deployment's main KV cache is stored.
+
+    The layout is identified positively: ``kind`` states which record layout
+    the cache holds, so a kernel is never handed bytes it cannot read. A
+    packed cache read as fp16 produces finite, plausible, silently wrong
+    numbers rather than a fault.
+    """
+
+    kind: str
+    key_cache: torch.Tensor
+    value_cache: torch.Tensor
+    k_scale: torch.Tensor | None = None
+    v_scale: torch.Tensor | None = None
+
+    @property
+    def is_int4(self) -> bool:
+        return self.kind == INT4_FP16_BLOCK
+
+
+def resolve_main_kv_layout(
+    kv_cache: torch.Tensor,
+    kv_cache_dtype: str,
+    num_kv_heads: int,
+    head_size: int,
+) -> QsaMainKvLayout:
+    """Views of the main KV cache for the layout it actually holds.
+
+    The packed ``int4_fp16_block`` cache is ``[blocks, 2, slots, heads,
+    record_bytes]``; the shared helper returns the payload/scale views as
+    ``[pages, heads, slots, ...]``.
+    """
+    if kv_cache_dtype == INT4_FP16_BLOCK:
+        # The packed cache is [blocks, 2, slots, heads, record_bytes]; the
+        # shared helper wants the payload/scale views as
+        # [pages, heads, slots, ...].
+        cache = int4_fp16_cache_view(kv_cache, num_kv_heads, head_size)
+        key, value, k_scale, v_scale = int4_fp16_read_views(cache, head_size)
+        return QsaMainKvLayout(INT4_FP16_BLOCK, key, value, k_scale, v_scale)
+    key_cache, value_cache = kv_cache.transpose(1, 2).split(head_size, dim=-1)
+    return QsaMainKvLayout(
+        "fp16",
+        canonicalize_singleton_dim_strides(key_cache),
+        canonicalize_singleton_dim_strides(value_cache),
+    )
 
 
 class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
@@ -74,11 +130,35 @@ class Qwen4ExpQSAFlashAttentionBackend(FlashAttentionBackend):
         "auto",
         "bfloat16",
         "float16",
+        INT4_FP16_BLOCK,
     ]
 
     @staticmethod
     def get_name() -> str:
         return "QWEN4_EXP_QSA_TRITON"
+
+    @classmethod
+    def customize_spec(cls, spec: AttentionSpec) -> AttentionSpec:
+        if spec.kv_quant_mode == KVQuantMode.INT4_FP16_BLOCK:
+            if (
+                spec.dtype != torch.uint8
+                or spec.head_size not in (128, 256)
+                or spec.head_size_v != spec.head_size
+            ):
+                raise ValueError(
+                    "int4_fp16_block requires equal K/V head sizes 128 or 256"
+                )
+            content = spec.num_kv_heads * int4_fp16_record_bytes(spec.head_size)
+            if spec.state_content_bytes is not None:
+                if spec.num_head_slots != 2 or spec.state_content_bytes != content:
+                    raise ValueError("incompatible int4_fp16_block cache specification")
+                return spec
+            # K/V as two head slots, so the packed records of one side are
+            # contiguous and the framework's per-layer view is
+            # [blocks, 2, slots, heads*record_bytes] -- the same convention
+            # the RDNA_ATTN backend publishes.
+            return replace(spec, num_head_slots=2, state_content_bytes=content)
+        return super().customize_spec(spec)
 
     @staticmethod
     def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
@@ -122,8 +202,10 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             raise NotImplementedError(
                 "Qwen4Exp QSA does not support decode context parallelism"
             )
-        if self.kv_cache_dtype not in ("auto", "bfloat16"):
-            raise NotImplementedError("Qwen4Exp QSA requires a BF16 main KV cache")
+        if self.kv_cache_dtype not in ("auto", "bfloat16", INT4_FP16_BLOCK):
+            raise NotImplementedError(
+                "Qwen4Exp QSA requires a BF16 or packed int4_fp16_block main KV cache"
+            )
         self.supports_quant_query_input = False
 
     def do_kv_cache_update(
@@ -135,6 +217,12 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         slot_mapping: torch.Tensor,
     ) -> None:
         if self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
+            return
+        if self.kv_cache_dtype == INT4_FP16_BLOCK:
+            # The packed writer takes [2, pages, slots, heads, record_bytes];
+            # it quantizes and packs each record.
+            cache = int4_fp16_cache_view(kv_cache, self.num_kv_heads, self.head_size)
+            ops.reshape_and_cache_int4_fp16_rdna2(key, value, cache, slot_mapping)
             return
         key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
         ops.reshape_and_cache_flash(
@@ -187,10 +275,18 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             raise RuntimeError("QSA owner did not provide its top-k buffer")
         logical_indices = topk_buffer[:num_tokens]
         token_to_req = token_to_req[:num_tokens]
-        key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
-        key_cache = canonicalize_singleton_dim_strides(key_cache)
-        value_cache = canonicalize_singleton_dim_strides(value_cache)
-        if key_cache.dtype != query.dtype or query.dtype not in (
+        layout = resolve_main_kv_layout(
+            kv_cache, self.kv_cache_dtype, self.num_kv_heads, self.head_size
+        )
+        key_cache, value_cache = layout.key_cache, layout.value_cache
+        if layout.is_int4:
+            # The packed payload is uint8; the query stays fp16. The layout
+            # was identified above, so the kernel is handed bytes it can read.
+            if query.dtype != torch.float16:
+                raise NotImplementedError(
+                    "Qwen4Exp QSA requires an FP16 query for a packed INT4 KV cache"
+                )
+        elif key_cache.dtype != query.dtype or query.dtype not in (
             torch.bfloat16,
             torch.float16,
         ):
@@ -206,6 +302,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             attn_metadata.block_table,
             token_to_req,
             output[:num_tokens],
+            int4_scales=((layout.k_scale, layout.v_scale) if layout.is_int4 else None),
         )
         return output
 
@@ -232,12 +329,36 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             raise ValueError("Qwen4Exp QSA requires a paged KV cache")
         if model_config.dtype not in (torch.bfloat16, torch.float16):
             raise NotImplementedError("Qwen4Exp QSA requires BF16 or FP16")
-        if cache_config.cache_dtype not in ("auto", "bfloat16", "float16"):
+        if cache_config.cache_dtype not in (
+            "auto",
+            "bfloat16",
+            "float16",
+            INT4_FP16_BLOCK,
+        ):
             raise NotImplementedError(
-                "Qwen4Exp QSA requires a BF16 or FP16 main KV cache"
+                "Qwen4Exp QSA requires a BF16/FP16 or packed int4_fp16_block "
+                "main KV cache"
             )
-        if getattr(quant_config, "kv_cache_scheme", None) is not None:
+        kv_cache_scheme = getattr(quant_config, "kv_cache_scheme", None)
+        if kv_cache_scheme is not None and cache_config.cache_dtype != INT4_FP16_BLOCK:
             raise NotImplementedError("Qwen4Exp QSA does not support KV quantization")
+        # The fused HIP QSA decode reads the main KV cache, so which kernel can
+        # serve this deployment follows from the cache layout. A packed cache
+        # has no Triton reader, so it needs the native packed-int4 kernel;
+        # the mode and the cache dtype have to agree.
+        from .ops.qsa_rdna2 import qsa_decode_mode, qsa_use_rdna2_int4
+
+        if qsa_decode_mode() == "int4" and cache_config.cache_dtype != INT4_FP16_BLOCK:
+            raise NotImplementedError(
+                "Qwen4Exp QSA: VLLM_RDNA_QSA_DECODE_MODE=int4 needs an "
+                "int4_fp16_block KV cache"
+            )
+        if cache_config.cache_dtype == INT4_FP16_BLOCK and not qsa_use_rdna2_int4():
+            raise NotImplementedError(
+                "Qwen4Exp QSA: an int4_fp16_block KV cache needs the native "
+                "packed-int4 HIP QSA decode; the Triton path cannot read the "
+                "packed record layout"
+            )
         parallel_config = vllm_config.parallel_config
         if (
             parallel_config.prefill_context_parallel_size > 1

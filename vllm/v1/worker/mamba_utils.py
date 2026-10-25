@@ -15,6 +15,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     get_temporal_copy_spec,
     is_conv_state_dim_first,
 )
+from vllm.platforms.rdna import on_rdna2_hip
 from vllm.triton_utils import tl, triton
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.math_utils import cdiv
@@ -33,6 +34,9 @@ logger = init_logger(__name__)
 # 16 saturates HBM on H100/GB200 across the reqs=8..128 range in
 # microbenchmarks
 _TEMPORAL_TILES = 16
+
+# Read once at import: the hot per-step paths must not re-evaluate the gate.
+_ON_RDNA2 = on_rdna2_hip()
 
 
 @triton.jit(do_not_specialize=["num_requests"])
@@ -521,6 +525,7 @@ def preprocess_mamba_align_fused_kernel(
     num_reqs,
     BLOCK_SIZE: tl.constexpr,
     MAMBA_BLOCK_SIZE: tl.constexpr,
+    collapse_acceptance_ptr=None,
 ):
     """Fused align preprocess: emit the pre-copy src column/offset AND advance
     state_idx (with accepted-token reset) in a single launch (V2 align).
@@ -552,6 +557,18 @@ def preprocess_mamba_align_fused_kernel(
     new_state_idx = (computed_after + MAMBA_BLOCK_SIZE - 1) // MAMBA_BLOCK_SIZE - 1
     tl.store(state_idx_ptr + req_indices, new_state_idx, mask=mask)
     should_reset = (state_idx >= 0) & (state_idx != new_state_idx)
+    if collapse_acceptance_ptr is not None:
+        # A non-spec decode reads the base conv/SSM snapshot, not the prior
+        # verification step's accepted-token offset. Commit that snapshot once
+        # when K drops to zero; ordinary speculative steps remain copy-free.
+        collapse = (
+            (query_end - query_start == 1)
+            & (num_accepted > 1)
+            & (state_idx >= 0)
+            & (state_idx == new_state_idx)
+        )
+        tl.store(collapse_acceptance_ptr + req_indices, collapse, mask=mask)
+        should_reset |= collapse
     tl.store(num_accepted_tokens_ptr + req_indices, 1, mask=mask & should_reset)
 
 
@@ -581,6 +598,7 @@ def precopy_mamba_align_fused_kernel(
     # TEMPORAL_TILES: see postprocess_mamba_fused_kernel. Default 1 preserves
     # the 2D-grid contract; > 1 requires a 3D grid.
     TEMPORAL_TILES: tl.constexpr = 1,
+    collapse_acceptance_ptr=None,
 ):
     """Pre-copy mamba "align" state across block boundaries.
 
@@ -613,8 +631,14 @@ def precopy_mamba_align_fused_kernel(
     # Fresh state, or still writing the same block: kernels locate the initial
     # state in-block via num_accepted (preserved when no boundary is crossed),
     # so there is nothing to copy.
-    if src_col < 0 or src_col == dst_col:
+    if src_col < 0:
         return
+    if src_col == dst_col:
+        if collapse_acceptance_ptr is None:
+            return
+        else:
+            if not tl.load(collapse_acceptance_ptr + req_idx):
+                return
 
     token_bias = tl.load(token_bias_ptr + req_idx)
     _copy_mamba_state_block(
@@ -669,6 +693,10 @@ def batch_memcpy(src_ptrs, dst_ptrs, sizes):
     batch = src_ptrs.shape[0]
     assert dst_ptrs.shape[0] == batch
     assert sizes.shape[0] == batch
+
+    if _ON_RDNA2:
+        torch.ops._rocm_C.batch_memcpy_rdna2(src_ptrs, dst_ptrs, sizes)
+        return
 
     grid = (batch,)
     BLOCK_SIZE = 1024
@@ -1220,6 +1248,34 @@ class MambaSpecDecodeGPUContext:
         )
 
         total_states = self.num_states
+        total_states = self.num_states
+        if _ON_RDNA2:
+            torch.ops._rocm_C.postprocess_mamba_fused_rdna2(
+                num_accepted_tokens_gpu,
+                mamba_state_idx_gpu,
+                num_scheduled_tokens_gpu,
+                num_computed_tokens_gpu,
+                num_draft_tokens_gpu,
+                self.block_table_ptrs,
+                self.block_table_stride_req,
+                self.state_base_addrs,
+                self.state_block_strides,
+                self.state_elem_sizes,
+                self.state_inner_sizes,
+                self.state_conv_widths,
+                self.state_group_indices,
+                self.state_dim_row_count,
+                self.state_dim_row_stride,
+                self.num_accepted_tokens_out,
+                None,
+                num_reqs,
+                self.block_size,
+                is_conv_state_dim_first(),
+                False,
+                _TEMPORAL_TILES,
+            )
+            return
+
         grid = (num_reqs, total_states, _TEMPORAL_TILES)
 
         postprocess_mamba_fused_kernel[grid](
@@ -1254,6 +1310,7 @@ class MambaSpecDecodeGPUContext:
         src_col_gpu: torch.Tensor,
         token_bias_gpu: torch.Tensor,
         idx_mapping: torch.Tensor | None,
+        collapse_acceptance_gpu: torch.Tensor | None = None,
     ) -> None:
         """Pre-copy each request's previous running block into its new window
         block before the forward pass (align boundary migration).
@@ -1265,11 +1322,37 @@ class MambaSpecDecodeGPUContext:
             token_bias_gpu: [max_reqs] accepted-token bias (num_accepted - 1).
             idx_mapping: optional [num_reqs] batch_idx -> req_state_idx.
                 None means V1 batch order already equals request state order.
+            collapse_acceptance_gpu: optional per-slot flag allowing an in-block
+                accepted-state commit when a V2 request changes to K=0.
 
         """
         if num_reqs == 0 or not self.is_initialized:
             return
         total_states = self.num_states
+        # The HIP kernel has no zero-draft collapse (dynamic speculation only):
+        # with a collapse flag, take the Triton kernel.
+        if _ON_RDNA2 and collapse_acceptance_gpu is None:
+            torch.ops._rocm_C.precopy_mamba_align_fused_rdna2(
+                state_idx_gpu,
+                src_col_gpu,
+                token_bias_gpu,
+                self.block_table_ptrs,
+                self.block_table_stride_req,
+                self.state_base_addrs,
+                self.state_block_strides,
+                self.state_elem_sizes,
+                self.state_inner_sizes,
+                self.state_conv_widths,
+                self.state_group_indices,
+                self.state_dim_row_count,
+                self.state_dim_row_stride,
+                idx_mapping,
+                num_reqs,
+                is_conv_state_dim_first(),
+                _TEMPORAL_TILES,
+            )
+            return
+
         grid = (num_reqs, total_states, _TEMPORAL_TILES)
         precopy_mamba_align_fused_kernel[grid](
             state_idx_gpu,
@@ -1291,6 +1374,7 @@ class MambaSpecDecodeGPUContext:
             CONV_STATE_DIM_FIRST=is_conv_state_dim_first(),
             HAS_IDX_MAPPING=idx_mapping is not None,
             TEMPORAL_TILES=_TEMPORAL_TILES,
+            collapse_acceptance_ptr=collapse_acceptance_gpu,
         )
 
     def run_fused_postprocess_align(
@@ -1320,6 +1404,33 @@ class MambaSpecDecodeGPUContext:
         num_accepted_tokens_snapshot.copy_(num_accepted_tokens_gpu)
 
         total_states = self.num_states
+        if _ON_RDNA2:
+            torch.ops._rocm_C.postprocess_mamba_fused_rdna2(
+                num_accepted_tokens_snapshot,
+                state_idx_gpu,
+                None,
+                new_num_computed_tokens_gpu,
+                None,
+                self.block_table_ptrs,
+                self.block_table_stride_req,
+                self.state_base_addrs,
+                self.state_block_strides,
+                self.state_elem_sizes,
+                self.state_inner_sizes,
+                self.state_conv_widths,
+                self.state_group_indices,
+                self.state_dim_row_count,
+                self.state_dim_row_stride,
+                num_accepted_tokens_gpu,
+                idx_mapping,
+                num_reqs,
+                self.block_size,
+                is_conv_state_dim_first(),
+                True,
+                _TEMPORAL_TILES,
+            )
+            return
+
         grid = (num_reqs, total_states, _TEMPORAL_TILES)
         postprocess_mamba_fused_kernel[grid](
             num_accepted_tokens_snapshot,

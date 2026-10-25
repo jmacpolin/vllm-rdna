@@ -276,13 +276,25 @@ class LogitsProcessor(PluggableLayer):
         the whole vocabulary; both are monotonic, so the selection is the same
         and only k entries are touched.
         """
+        timer = (
+            phase_timer
+            if phase_timer is not None
+            and not torch.compiler.is_compiling()
+            and phase_timer.cur is not None
+            and not torch.cuda.is_current_stream_capturing()
+            else None
+        )
         if self.scale <= 0.0 and self.scale != 1.0:
             raise ValueError(
                 "The local top-k reduction optimization is not supported for "
                 "non-positive logit scaling factors."
             )
 
+        if timer is not None:
+            timer.mark("dflash_head_prep")
         logits = self._apply_head(lm_head, hidden_states, embedding_bias)
+        if timer is not None:
+            timer.mark("dflash_head_gemm")
         if return_log_probs:
             if self.soft_cap is not None:
                 logits = torch.tanh(logits / self.soft_cap) * self.soft_cap
@@ -304,6 +316,8 @@ class LogitsProcessor(PluggableLayer):
                 )
 
         values, ids = _topk(logits, k)
+        if timer is not None:
+            timer.mark("dflash_head_local_topk")
         # Convert shard-local indices to global vocab indices.
         ids = ids.to(torch.int64) + lm_head.shard_indices.org_vocab_start_index
 
@@ -312,6 +326,8 @@ class LogitsProcessor(PluggableLayer):
             ids = tensor_model_parallel_all_gather(ids, dim=-1)
             values, selected = _topk(values, k)
             ids = ids.gather(-1, selected)
+        if timer is not None:
+            timer.mark("dflash_head_gather")
 
         values = values.float()
         if return_log_probs:
