@@ -563,10 +563,28 @@ def test_it_checks_the_buses_again_before_every_arm(proof: Proof):
 # ---- serve_validate.sh: the quiet-window protocol ---------------------------------
 
 
+def _fake_hwmon(root: Path, temp_c: int) -> Path:
+    """One amdgpu card with an edge sensor at ``temp_c``, for the thermal abort."""
+    dev = root / "devices/0000:03:00.0"
+    dev.mkdir(parents=True, exist_ok=True)
+    hw = root / "class/hwmon0"
+    hw.mkdir(parents=True, exist_ok=True)
+    (hw / "name").write_text("amdgpu\n")
+    if not (hw / "device").exists():
+        (hw / "device").symlink_to(dev)
+    (hw / "temp1_input").write_text(f"{temp_c * 1000}\n")
+    (hw / "temp1_label").write_text("edge\n")
+    return root / "class"
+
+
 def _sv_setup(tmp_path: Path, **env: str) -> tuple[list[str], dict[str, str]]:
     tree = tmp_path / "svtree"
     (tree / "tools/rdna/port_v031").mkdir(parents=True, exist_ok=True)
     shutil.copy(PORT_V031 / "serve_validate.sh", tree / "tools/rdna/port_v031/")
+    # The stub SERVE_SCRIPT is outside the tree, so it runs under the tree's
+    # thermal abort: the guard's library and a cool card it can read.
+    shutil.copy(PORT_V031.parent / "rdna_launcher_common.sh", tree / "tools/rdna/")
+    hwmon = _fake_hwmon(tmp_path / "sys", 40)
     stub = tmp_path / "serve_stub.sh"
     stub.write_text("#!/usr/bin/env bash\nexit 1\n")  # the boot fails at once
     full = {
@@ -579,6 +597,7 @@ def _sv_setup(tmp_path: Path, **env: str) -> tuple[list[str], dict[str, str]]:
         "CACHE": str(tmp_path / "cache"),
         "VENV": str(tmp_path / "venv"),
         "SERVE_SCRIPT": str(stub),
+        "RDNA_HWMON_ROOT": str(hwmon),
         **env,
     }
     return ["bash", str(tree / "tools/rdna/port_v031/serve_validate.sh")], full
@@ -685,6 +704,22 @@ def test_serve_validate_lets_go_of_the_lock_when_a_window_opens_under_it(
 def test_serve_validate_without_quiet_dir_is_unchanged(tmp_path: Path):
     res = _serve_validate(tmp_path)
     assert "BOOT FAILED" in res.stdout and "quiet" not in res.stdout
+
+
+def test_serve_validate_refuses_an_outside_serve_script_on_a_hot_card(
+    tmp_path: Path,
+):
+    cmd, env = _sv_setup(tmp_path)
+    _fake_hwmon(tmp_path / "sys", 90)  # at the limit: the guard must refuse
+    (tmp_path / "serve_stub.sh").write_text(
+        f'#!/usr/bin/env bash\ntouch "{tmp_path}/served"\nexit 1\n'
+    )
+    res = run_group(cmd, env, timeout=120)
+    assert "running it under this tree's thermal abort" in res.stdout
+    assert "BOOT FAILED" in res.stdout
+    serve_log = (tmp_path / "out/serve.log").read_text()
+    assert "a GPU is already at edge 90°C on 0000:03:00.0" in serve_log
+    assert not (tmp_path / "served").exists()
 
 
 def _quiet_functions() -> str:
