@@ -20,6 +20,10 @@
 # PRINT=1 (alias --dry-run) assembles the environment, the TunableOp profile
 # that would be selected, and the exact command, then exits without launching.
 #
+# Thermal abort: serving stops when any GPU temperature sensor reads
+# THERMAL_ABORT_C (default and maximum 90 °C) or more; the launcher then exits
+# with status 90 (rdna_serve_guarded in rdna_launcher_common.sh).
+#
 # Nothing in this file or the recipes bakes in a host, user, or IP.
 set -euo pipefail
 
@@ -184,6 +188,7 @@ fi
 if ((rdse_print)); then
     RDNA_DRY_RUN=1
 fi
+rdse_thermal_c=$(rdna_thermal_limit)
 rdna_init
 
 case $PLE in
@@ -410,6 +415,8 @@ rdse_print_plan() {
     printf '# entry:     %s\n' "$SERVE_ENTRY"
     printf '# ple:       %s%s\n' "$PLE" "${PLE_QUANT_DIR:+ ($PLE_QUANT_DIR)}"
     printf '# p2p:       %s\n' "$([[ $P2P == 0 ]] && echo 'off (no rdna_ar, RCCL over SHM)' || echo on)"
+    printf '# thermal:   stop at %s°C on any %s sensor (THERMAL_ABORT_C; exit status %s)\n' \
+        "$rdse_thermal_c" "${THERMAL_GUARD_GPUS:+watched ($THERMAL_GUARD_GPUS) }AMD GPU" "$RDNA_THERMAL_EXIT"
     printf '\n# --- environment ---\n'
     for _key in "${RDSE_ENV_KEYS[@]}"; do
         if [[ -v $_key ]]; then
@@ -431,4 +438,4 @@ fi
 
 rdna_kill_stale
 rdna_run_cwd
-exec "${cmd[@]}"
+rdna_serve_guarded "${cmd[@]}"

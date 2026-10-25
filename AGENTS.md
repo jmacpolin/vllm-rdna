@@ -29,6 +29,13 @@ MODEL=/path/to/checkpoint VENV=/path/to/venv \
   (for example `EXTRA_ARGS=--monokernel`).
 - Flash-Next PLE table: `PLE=bf16` (default, ~95 GB host RAM), `PLE=int4` or
   `PLE=int4-disk` with `PLE_QUANT_DIR=/path/to/ples_int4`.
+- Thermal abort: every launcher stops serving when any AMD GPU temperature
+  sensor (edge, junction, memory) reads `THERMAL_ABORT_C` or more, default and
+  maximum 90 °C, and exits with status 90. It refuses to start while a card is
+  already that hot or no sensor can be read. `THERMAL_GUARD_GPUS=<pci,...>`
+  narrows the watched cards on a host shared with another job. A new launcher
+  calls `rdna_serve_guarded "${cmd[@]}"` (`tools/rdna/rdna_launcher_common.sh`)
+  where it would `exec` the server.
 
 ### Common mistakes
 

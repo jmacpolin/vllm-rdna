@@ -63,7 +63,17 @@ fi
 
 log "boot TREE=$SERVE_TREE RECIPE=$RECIPE MODEL=$MODEL GPUS=$GPUS PORT=$PORT overrides=$* bench_extra=${BENCH_EXTRA:-}"
 dmesg_before=$(sudo -n dmesg 2>/dev/null | wc -l || echo 0)
-setsid bash "$SERVE_SCRIPT" RECIPE="$RECIPE" MODEL="$MODEL" \
+# Serving stops at 90 °C (THERMAL_ABORT_C). This tree's launchers do that
+# themselves; a SERVE_SCRIPT from another tree (the A/B baseline) runs under
+# this tree's rdna_serve_guarded instead.
+serve_launch=(bash "$SERVE_SCRIPT")
+if [[ $(cd "$(dirname "$SERVE_SCRIPT")" && pwd)/ != "$TREE"/* ]]; then
+    # shellcheck disable=SC2016  # expanded by the inner bash
+    serve_launch=(bash -c 'source "$1"; shift; rdna_serve_guarded bash "$@"' _
+        "$TREE/tools/rdna/rdna_launcher_common.sh" "$SERVE_SCRIPT")
+    log "SERVE_SCRIPT is outside this tree: running it under this tree's thermal abort"
+fi
+setsid "${serve_launch[@]}" RECIPE="$RECIPE" MODEL="$MODEL" \
     VENV="$VENV" VLLM_TREE="$SERVE_TREE" HIP_VISIBLE_DEVICES="$GPUS" ROCR_VISIBLE_DEVICES= PORT="$PORT" \
     HOST=127.0.0.1 VLLM_CACHE_ROOT="$VLLM_CACHE_ROOT" \
     TRITON_CACHE_DIR="$TRITON_CACHE_DIR" \
@@ -94,7 +104,7 @@ done
 boot_s=$(( $(date +%s) - t0 ))
 if (( ! ready )); then
     log "BOOT FAILED after ${boot_s}s"
-    grep -aE "Error|error:|Traceback|raise |Exception|Memory Fault|HSA_STATUS|out of memory" \
+    grep -aE "THERMAL ABORT|Error|error:|Traceback|raise |Exception|Memory Fault|HSA_STATUS|out of memory" \
         "$OUT/serve.log" | tail -25 | tee -a "$SUM"
     exit 1
 fi
@@ -191,7 +201,7 @@ for cell in $CELLS; do
     python3 "$TREE/tools/rdna/port_v031/bench_metrics.py" "$OUT/$name.json" \
         | sed 's/^/    /' | tee -a "$SUM"
     if ! kill -0 "$SPID" 2>/dev/null; then
-        log "SERVER DIED during $name"
+        log "SERVER DIED during $name $(grep -a -m1 '^THERMAL ABORT' "$OUT/serve.log")"
         break
     fi
 done
@@ -215,6 +225,8 @@ grep -aoE "Using [A-Za-z0-9_]+(MoEMethod|LinearKernel|Kernel)[^\"]*|Selected [A-
     "$OUT/serve.log" | sort | uniq -c | sort -rn | head -40 | sed 's/^/    /' | tee -a "$SUM"
 faults=$(grep -acE "Memory Fault|HSA_STATUS_ERROR|page fault|Segmentation fault|core dumped" "$OUT/serve.log")
 log "fault markers in serve.log: $faults"
+thermal=$(grep -a -m1 '^THERMAL ABORT' "$OUT/serve.log")
+[[ -z $thermal ]] || log "$thermal"
 dmesg_new=$(sudo -n dmesg 2>/dev/null | tail -n +$((dmesg_before + 1)) | grep -iE "amdgpu.*(fault|timeout|reset)|UTCL2|AER|Hardware Error" | grep -vc "uses VM inv eng" || echo "n/a")
 log "new amdgpu dmesg faults: $dmesg_new"
 log "done"

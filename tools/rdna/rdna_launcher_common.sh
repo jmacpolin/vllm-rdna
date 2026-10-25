@@ -16,6 +16,7 @@
 #   rdna_select_attention fa  # fa | triton  (sets $attention_backend)
 #   rdna_mtp_args 2           # sets $spec_args and $capture_sizes
 #   rdna_kill_stale           # scoped to $VLLM_CACHE_ROOT
+#   rdna_serve_guarded "${cmd[@]}"   # in place of exec: the thermal abort
 #
 # Env knobs (all optional unless noted):
 #   VLLM_TREE   repo root        (default: two levels above tools/rdna/)
@@ -28,6 +29,10 @@
 #   VLLM_CACHE_ROOT / TRITON_CACHE_DIR / TORCHINDUCTOR_CACHE_DIR /
 #   TORCH_EXTENSIONS_DIR         (default: <tree>/cache/*)
 #   RUN_CWD                      (default: <tree>/cache/run; never /tmp)
+#   THERMAL_ABORT_C              serving stops at this GPU temperature, °C
+#                                (default and maximum 90; see rdna_serve_guarded)
+#   THERMAL_GUARD_GPUS           PCI addresses the thermal abort watches
+#                                (default: every AMD GPU)
 
 _RDNA_COMMON_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
@@ -165,4 +170,116 @@ rdna_kill_stale() {
             fi
         fi
     done
+}
+
+# --- thermal abort -------------------------------------------------------------
+# Every serve launcher stops serving when any watched GPU temperature sensor
+# (amdgpu hwmon: edge, junction, memory) reads THERMAL_ABORT_C or more. The
+# limit is 90 °C, and a launch may lower it, never raise it. The V620 reports
+# junction crit 100 °C and memory crit 98 °C, so 90 °C sits 10 and 8 below.
+#
+#   rdna_serve_guarded "${cmd[@]}"
+#
+# goes where a launcher would `exec "${cmd[@]}"`. It refuses to start when no
+# sensor can be read or a card is already at the limit. Otherwise it runs the
+# server as a child and reads the sensors every THERMAL_GUARD_INTERVAL seconds
+# (2). At the first reading at or above the limit it prints "THERMAL ABORT: ..."
+# to stderr, sends the server SIGTERM, and after THERMAL_GUARD_GRACE seconds
+# (30) SIGKILLs the server and its descendants if it is still running. It then
+# exits with status RDNA_THERMAL_EXIT (90), so a service manager can tell a
+# thermal abort from a crash (systemd: RestartPreventExitStatus=90). Otherwise
+# it exits with the server's status. SIGTERM, SIGINT and SIGHUP to the launcher
+# reach the server as SIGTERM, so systemd, podman stop (the launcher is the
+# container's PID 1) and Ctrl-C shut it down as before.
+#
+# Every AMD GPU is watched, not only HIP_VISIBLE_DEVICES: a wrong guess at the
+# HIP-to-PCI order would leave the serving cards unwatched. THERMAL_GUARD_GPUS
+# (PCI addresses, e.g. 0000:6f:00.0,0000:72:00.0) narrows it, for a host whose
+# other cards belong to another job.
+
+RDNA_THERMAL_EXIT=90
+RDNA_HWMON_ROOT=${RDNA_HWMON_ROOT:-/sys/class/hwmon}  # override only for testing
+
+# One line per watched sensor: "<pci address> <label> <°C>".
+rdna_gpu_temps() {
+    local h bdf f v want=",${THERMAL_GUARD_GPUS:-},"
+    want=${want// /}
+    for h in "$RDNA_HWMON_ROOT"/hwmon*; do
+        [[ $(cat "$h/name" 2>/dev/null) == amdgpu ]] || continue
+        bdf=$(basename -- "$(readlink -f -- "$h/device")")
+        if [[ $want != ,, && $want != *",$bdf,"* && $want != *",${bdf#*:},"* ]]; then
+            continue
+        fi
+        for f in "$h"/temp*_input; do
+            v=$(cat "$f" 2>/dev/null) || continue
+            [[ $v =~ ^[0-9]+$ ]] || continue
+            printf '%s %s %s\n' "$bdf" "$(cat "${f%_input}_label" 2>/dev/null || basename -- "${f%_input}")" "$((v / 1000))"
+        done
+    done
+}
+
+# rdna_gpu_hot LIMIT: the hottest watched sensor at or above LIMIT, e.g.
+# "junction 91°C on 0000:6f:00.0" (status 0); status 1 when all read below.
+rdna_gpu_hot() {
+    rdna_gpu_temps | awk -v lim="$1" '$3 >= lim && (hot == "" || $3 > max) { max = $3; hot = $2 " " $3 "°C on " $1 }
+        END { if (hot == "") exit 1; print hot }'
+}
+
+# The validated limit on stdout; exits the launcher on a bad THERMAL_ABORT_C.
+rdna_thermal_limit() {
+    local limit=${THERMAL_ABORT_C:-90}
+    if [[ ! $limit =~ ^[0-9]+$ ]] || ((limit < 1 || limit > 90)); then
+        rdna_die "THERMAL_ABORT_C must be a whole number of °C from 1 to 90 (got '$limit'): serving stops at 90 °C at the latest."
+    fi
+    printf '%s\n' "$limit"
+}
+
+rdna_descendants() {
+    local c
+    for c in $(pgrep -P "$1" 2>/dev/null || true); do
+        printf '%s\n' "$c"
+        rdna_descendants "$c"
+    done
+}
+
+rdna_serve_guarded() {
+    local limit every=${THERMAL_GUARD_INTERVAL:-2} grace=${THERMAL_GUARD_GRACE:-30}
+    local pid hot n rc=0 t
+    limit=$(rdna_thermal_limit) || exit 1
+    [[ $every =~ ^[1-9][0-9]*$ ]] || rdna_die "THERMAL_GUARD_INTERVAL must be a whole number of seconds (got '$every')."
+    [[ $grace =~ ^[0-9]+$ ]] || rdna_die "THERMAL_GUARD_GRACE must be a whole number of seconds (got '$grace')."
+    n=$(rdna_gpu_temps | wc -l)
+    ((n > 0)) || rdna_die "no AMD GPU temperature sensor found (amdgpu hwmon under $RDNA_HWMON_ROOT${THERMAL_GUARD_GPUS:+, THERMAL_GUARD_GPUS=$THERMAL_GUARD_GPUS}); refusing to serve without the thermal abort."
+    if hot=$(rdna_gpu_hot "$limit"); then
+        rdna_die "a GPU is already at $hot (THERMAL_ABORT_C=$limit); let it cool before serving."
+    fi
+    printf 'thermal: serving stops at %s°C on any of %s GPU sensors, read every %ss (hottest now: %s)\n' \
+        "$limit" "$n" "$every" "$(rdna_gpu_hot 0 || echo '?')" >&2
+
+    "$@" &
+    pid=$!
+    trap 'kill -TERM "$pid" 2>/dev/null || true' TERM INT HUP
+    while kill -0 "$pid" 2>/dev/null; do
+        if hot=$(rdna_gpu_hot "$limit"); then
+            trap - TERM INT HUP
+            printf 'THERMAL ABORT: %s (THERMAL_ABORT_C=%s); stopping the server (pid %s)\n' "$hot" "$limit" "$pid" >&2
+            kill -TERM "$pid" 2>/dev/null || true
+            for ((t = 0; t < grace; t++)); do
+                kill -0 "$pid" 2>/dev/null || break
+                sleep 1
+            done
+            if kill -0 "$pid" 2>/dev/null; then
+                printf 'THERMAL ABORT: the server is still running after %ss; SIGKILL to it and its descendants\n' "$grace" >&2
+                # shellcheck disable=SC2046  # one PID per word
+                kill -KILL $(rdna_descendants "$pid") "$pid" 2>/dev/null || true
+            fi
+            wait "$pid" 2>/dev/null || true
+            exit "$RDNA_THERMAL_EXIT"
+        fi
+        # In the background, so a signal interrupts the wait and reaches the trap at once.
+        sleep "$every" &
+        wait $! || true
+    done
+    wait "$pid" || rc=$?
+    exit "$rc"
 }
