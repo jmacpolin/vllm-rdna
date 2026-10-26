@@ -119,4 +119,7 @@ if not Path(vllm.__file__).resolve().is_relative_to(source):
     raise SystemExit("The testing environment imports a different vLLM checkout")
 PY
 cd "$source_dir"
-exec "${command[@]}" "$@"
+# Serving stops at 90 °C (THERMAL_ABORT_C; rdna_launcher_common.sh).
+# shellcheck source=tools/rdna/rdna_launcher_common.sh
+source "$source_dir/tools/rdna/rdna_launcher_common.sh"
+rdna_serve_guarded "${command[@]}" "$@"
