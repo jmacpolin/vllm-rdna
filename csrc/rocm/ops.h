@@ -43,9 +43,10 @@ at::Tensor gemv_f16_rdna2(const at::Tensor& x, const at::Tensor& w,
 at::Tensor gemv_i8_rdna2(const at::Tensor& x, const at::Tensor& w,
                          const at::Tensor& scale,
                          const std::optional<at::Tensor>& bias);
-at::Tensor rdna_gemv_act(const at::Tensor& x, const at::Tensor& w,
-                         const std::optional<at::Tensor>& scale,
-                         int64_t act_cols, double act_scale);
+std::tuple<at::Tensor, at::Tensor> rdna_gemv_act(
+    const at::Tensor& x, const at::Tensor& w,
+    const std::optional<at::Tensor>& scale, int64_t act_cols, double act_scale,
+    int64_t inj_cols);
 at::Tensor rdna_hc_up_gate_mix(const at::Tensor& lora, const at::Tensor& w,
                                const std::optional<at::Tensor>& scale,
                                const at::Tensor& xn, int64_t hc_count);
@@ -152,11 +153,21 @@ std::tuple<at::Tensor, at::Tensor> rdna_hc_mix_prefill(const at::Tensor& xn,
                                                        const at::Tensor& w_up,
                                                        int64_t lora_rank,
                                                        int64_t hc_count);
-at::Tensor rdna_se_gate_up_silu(const at::Tensor& x, const at::Tensor& w,
-                                const std::optional<at::Tensor>& scale);
+at::Tensor rdna_gemm_smallm(const at::Tensor& x, const at::Tensor& w);
+std::tuple<at::Tensor, at::Tensor> rdna_se_gate_up_tile(
+    const at::Tensor& x, const at::Tensor& w, const at::Tensor& w_gate);
+at::Tensor rdna_se_down_tile(const at::Tensor& act, const at::Tensor& w,
+                             const at::Tensor& gate);
+std::tuple<at::Tensor, at::Tensor> rdna_se_gate_up_silu(
+    const at::Tensor& x, const at::Tensor& w,
+    const std::optional<at::Tensor>& scale, const at::Tensor& w_gate);
 at::Tensor rdna_se_down_gated(const at::Tensor& act, const at::Tensor& w,
                               const std::optional<at::Tensor>& scale,
-                              const at::Tensor& x, const at::Tensor& w_gate);
+                              const at::Tensor& gate);
+std::tuple<at::Tensor, at::Tensor, at::Tensor> rdna_moe_route_zero(
+    const at::Tensor& topk_ids, int64_t block_size, int64_t num_experts,
+    const std::optional<at::Tensor>& expert_map, at::Tensor& zero1,
+    at::Tensor& zero2);
 
 torch::Tensor wvSplitKrc(const at::Tensor& in_a, const at::Tensor& in_b,
                          const std::optional<at::Tensor>& in_bias,
@@ -169,13 +180,14 @@ void wvSplitKQ(const at::Tensor& in_a, const at::Tensor& in_b,
 
 torch::Tensor gptq_gemm_rdna2(torch::Tensor a, torch::Tensor b_q_weight,
                               torch::Tensor b_qzeros, torch::Tensor b_scales,
-                              torch::Tensor b_g_idx, bool use_v2_format);
+                              torch::Tensor b_g_idx, bool use_v2_format,
+                              bool deterministic = false);
 
 torch::Tensor gptq_gemm_rdna2_prefill(torch::Tensor a, torch::Tensor b_q_weight,
                                       torch::Tensor b_qzeros,
                                       torch::Tensor b_scales,
-                                      torch::Tensor b_g_idx,
-                                      bool use_v2_format);
+                                      torch::Tensor b_g_idx, bool use_v2_format,
+                                      bool deterministic = false);
 
 // W4A8 (int4 weights, int8 activations) prefill GEMM for gfx1030. Opt-in
 // drop-in for the dense W4A16 prefill. The gemm entry is self-contained and
@@ -200,6 +212,8 @@ at::Tensor w4a8_act_quant_rdna2(const at::Tensor& x, int64_t group_size,
 at::Tensor w4a8_gemm_rdna2(torch::Tensor a, torch::Tensor b_q_weight,
                            torch::Tensor b_qzeros, torch::Tensor b_scales,
                            torch::Tensor b_g_idx, bool use_v2_format);
+torch::Tensor mxfp4_w4a8_gemv_rdna3(const at::Tensor& a, const at::Tensor& b_q,
+                                    const at::Tensor& b_scale);
 
 torch::Tensor gptq_gemm_rdna3(torch::Tensor a, torch::Tensor b_q_weight,
                               torch::Tensor b_qzeros, torch::Tensor b_scales,
@@ -227,16 +241,28 @@ void paged_attention(
     int64_t max_seq_len, const std::optional<torch::Tensor>& alibi_slopes,
     const std::string& kv_cache_dtype, torch::Tensor& k_scale,
     torch::Tensor& v_scale, const std::optional<torch::Tensor>& fp8_out_scale,
-    const std::string& mfma_type);
+    const std::string& mfma_type, bool use_interleaved_v_cache);
 
 // T44: gfx1030 push-based one-shot all-reduce (opt-in via VLLM_RDNA_AR).
 // Protocol from leapdragon/vllm-rdna2-qwen T44/T44b (Aron Hsiao).
 at::Tensor rdna_ar_init(int64_t rank, int64_t world,
                         const at::Tensor& device_ids, int64_t max_bytes,
-                        const std::string& shm_name);
+                        const std::string& shm_name, int64_t gate_bytes);
 void rdna_ar_connect(int64_t handle, const at::Tensor& handles);
 bool rdna_ar_can(int64_t handle, const at::Tensor& t);
 at::Tensor rdna_ar_all_reduce(int64_t handle, const at::Tensor& in);
+// Hierarchical all-reduce for two PCIe-switch islands (VLLM_RDNA_AR_HIER).
+void rdna_ar_hier_init(int64_t handle, const at::Tensor& island_of_rank,
+                       int64_t owners, int64_t min_kb, int64_t algo,
+                       int64_t blocks, int64_t gate_kb);
+at::Tensor rdna_ar_all_reduce_algo(int64_t handle, const at::Tensor& in,
+                                   int64_t algo, int64_t blocks);
+bool rdna_ar_can_all_gather(int64_t handle, const at::Tensor& t);
+at::Tensor rdna_ar_all_gather(int64_t handle, const at::Tensor& in);
+bool rdna_ar_can_argmax(int64_t handle, const at::Tensor& vals,
+                        const at::Tensor& idx);
+at::Tensor rdna_ar_argmax(int64_t handle, const at::Tensor& vals,
+                          const at::Tensor& idx);
 bool rdna_ar_timed_out(int64_t handle);
 int64_t rdna_ar_timeout_info(int64_t handle);
 int64_t rdna_ar_slow_info(int64_t handle);
@@ -280,6 +306,19 @@ void fa_rdna2_prefill_paged_varlen_splitk(
     torch::Tensor block_table, torch::Tensor cu_query_lens,
     torch::Tensor seq_lens, int64_t block_size, int64_t causal,
     int64_t kv_splits, int64_t sliding_window, double scale, torch::Tensor out);
+
+// int8 per-(position, head) KV cache split-K paged prefill; returns a fresh
+// [num_tokens, H_q, D] fp16 output and scales Q.K^T by 1/sqrt(D). Only tests
+// call it: RDNA_ATTN rejects quantized KV caches.
+torch::Tensor fa_rdna2_prefill_paged_varlen_int8(
+    torch::Tensor Q, torch::Tensor key_cache, torch::Tensor value_cache,
+    torch::Tensor block_table, torch::Tensor cu_query_lens,
+    torch::Tensor seq_lens, int64_t block_size, int64_t causal,
+    int64_t sliding_window, int64_t kv_splits, torch::Tensor k_scale,
+    torch::Tensor v_scale);
+
+// Test hook: the split-K prefill partial workspaces (see fa_rdna2.cu).
+std::vector<torch::Tensor> fa_rdna2_prefill_splitk_workspaces(bool int8);
 
 void fa_rdna2_prefill_paged_varlen_gqa(
     torch::Tensor Q, torch::Tensor key_cache, torch::Tensor value_cache,
@@ -625,6 +664,10 @@ torch::Tensor mqa_logits_prefill_rdna2(torch::Tensor q, torch::Tensor k,
 void rms_norm(torch::Tensor& out, const torch::Tensor& input,
               const torch::Tensor& weight, double epsilon);
 
+// y = x * rsqrt(mean(x^2) + eps) * (1 + w), (1 + w) rounded to fp16 first.
+void gemma_rms_norm(torch::Tensor& out, const torch::Tensor& input,
+                    const torch::Tensor& weight, double epsilon);
+
 void fused_add_rms_norm(torch::Tensor& input, torch::Tensor& residual,
                         const torch::Tensor& weight, double epsilon);
 
@@ -921,7 +964,8 @@ torch::Tensor qsa_sparse_paged_attention_int4_rdna2(
 torch::Tensor qsa_expand_indices_rdna2(
     const at::Tensor& block_indices, const at::Tensor& query_positions,
     const at::Tensor& sequence_lengths, const at::Tensor& token_to_req,
-    int64_t compress_ratio, int64_t token_topk, c10::optional<at::Tensor> out);
+    int64_t compress_ratio, int64_t token_topk, c10::optional<at::Tensor> out,
+    bool canonical_order);
 
 std::tuple<torch::Tensor, torch::Tensor> qsa_mqa_paged_rdna2(
     const at::Tensor& q, const at::Tensor& k_cache,
@@ -996,7 +1040,11 @@ void gather_block_tables_rdna2(
     torch::Tensor dst_block_table_ptrs,  // [num_kv_cache_groups] uint64
     torch::Tensor block_table_strides,   // [num_kv_cache_groups] int64
     torch::Tensor num_blocks_ptr,        // [num_kv_cache_groups, max_num_reqs]
-    int64_t num_blocks_stride, int64_t num_reqs, int64_t num_reqs_padded);
+    int64_t num_blocks_stride, int64_t num_reqs, int64_t num_reqs_padded,
+    torch::Tensor num_computed_tokens,   // [max_num_reqs] int32
+    torch::Tensor sliding_window_reach,  // [num_kv_cache_groups] int32
+    torch::Tensor block_sizes,           // [num_kv_cache_groups] int32
+    bool mask_sliding_window);
 
 void compute_slot_mappings_rdna2(
     int64_t max_num_tokens,
@@ -1006,7 +1054,6 @@ void compute_slot_mappings_rdna2(
     torch::Tensor block_table_ptrs,      // [num_kv_cache_groups] uint64
     torch::Tensor block_table_strides,   // [num_kv_cache_groups] int64
     torch::Tensor block_sizes,           // [num_kv_cache_groups] int32
-    torch::Tensor kernel_block_sizes,    // [num_kv_cache_groups] int32
     torch::Tensor slot_mapping_enabled,  // [num_kv_cache_groups] bool
     torch::Tensor dcp_sharded,           // [num_kv_cache_groups] bool
     torch::Tensor slot_mappings,  // [num_kv_cache_groups, max_num_tokens]
@@ -1110,7 +1157,10 @@ void post_update_rdna2(torch::Tensor idx_mapping,
                        torch::Tensor num_rejected,
                        const std::optional<torch::Tensor>& query_start_loc,
                        torch::Tensor all_token_ids,
-                       int64_t all_token_ids_stride, torch::Tensor total_len);
+                       int64_t all_token_ids_stride, torch::Tensor total_len,
+                       const std::optional<torch::Tensor>& draft_tokens,
+                       const std::optional<torch::Tensor>& draft_tokens_out,
+                       int64_t num_draft_tokens);
 
 void expand_idx_mapping_rdna2(torch::Tensor idx_mapping,
                               torch::Tensor expanded_idx_mapping,
@@ -1273,3 +1323,77 @@ void spec_insert_resampled_rdna2(
     torch::Tensor resampled_local_argmax, torch::Tensor resampled_local_max,
     int64_t resample_num_blocks, torch::Tensor cu_num_logits,
     torch::Tensor expanded_idx_mapping, torch::Tensor temperature);
+
+// rdna_hint_flex (HadamardINT2-FP16 spec v3.2) weight kernels for AMD RDNA2
+// (gfx1030), F16 compute mode. Flat per-row ragged buffers
+// (codes/code_off/blk_params/ param_off/row_consts/row_nbits/row_block); see
+// rdna_hint_flex_rdna2.cu.
+void rdna_hint_flex_act_transform_rdna2(torch::Tensor x,
+                                        torch::Tensor col_scale,
+                                        torch::Tensor had, torch::Tensor out);
+void rdna_hint_flex_gemv_rdna2(torch::Tensor x, torch::Tensor codes,
+                               torch::Tensor code_off, torch::Tensor blk_params,
+                               torch::Tensor param_off,
+                               torch::Tensor row_consts,
+                               torch::Tensor row_nbits, torch::Tensor row_block,
+                               torch::Tensor out);
+void rdna_hint_flex_dequant_rdna2(torch::Tensor codes, torch::Tensor code_off,
+                                  torch::Tensor blk_params,
+                                  torch::Tensor param_off,
+                                  torch::Tensor row_consts,
+                                  torch::Tensor row_nbits,
+                                  torch::Tensor row_block, torch::Tensor out);
+torch::Tensor rdna_hint_flex_linear_rdna2(
+    torch::Tensor x, torch::Tensor col_scale, torch::Tensor had,
+    torch::Tensor codes, torch::Tensor code_off, torch::Tensor blk_params,
+    torch::Tensor param_off, torch::Tensor row_consts, torch::Tensor row_nbits,
+    torch::Tensor row_block, bool transform, int64_t decode_max_m,
+    int64_t mode);
+void rdna_hint_flex_act_quant_rdna2(torch::Tensor x, torch::Tensor col_scale,
+                                    torch::Tensor had, bool transform,
+                                    torch::Tensor xq, torch::Tensor sx,
+                                    torch::Tensor sumq);
+void rdna_hint_flex_gemv_i8_rdna2(
+    torch::Tensor xq, torch::Tensor sx, torch::Tensor sumq, torch::Tensor codes,
+    torch::Tensor code_off, torch::Tensor blk_params, torch::Tensor param_off,
+    torch::Tensor row_consts, torch::Tensor row_nbits, torch::Tensor row_block,
+    torch::Tensor out);
+torch::Tensor rdna_hint_flex_moe_rdna2(
+    torch::Tensor x, torch::Tensor topk_ids, torch::Tensor topk_weights,
+    torch::Tensor w13_codes, torch::Tensor w13_code_off,
+    torch::Tensor w13_blk_params, torch::Tensor w13_param_off,
+    torch::Tensor w13_row_consts, torch::Tensor w13_row_nbits,
+    torch::Tensor w13_row_block, torch::Tensor w13_col_scale,
+    torch::Tensor w13_had, bool w13_transform, torch::Tensor w2_codes,
+    torch::Tensor w2_code_off, torch::Tensor w2_blk_params,
+    torch::Tensor w2_param_off, torch::Tensor w2_row_consts,
+    torch::Tensor w2_row_nbits, torch::Tensor w2_row_block,
+    torch::Tensor w2_col_scale, torch::Tensor w2_had, bool w2_transform,
+    int64_t num_experts, int64_t intermediate, int64_t mode,
+    int64_t decode_max_m);
+void rdna_hint_flex_gemm_rdna2(torch::Tensor x, torch::Tensor codes,
+                               torch::Tensor code_off, torch::Tensor blk_params,
+                               torch::Tensor param_off,
+                               torch::Tensor row_consts,
+                               torch::Tensor row_nbits, torch::Tensor row_block,
+                               torch::Tensor out);
+void rdna_hint_flex_act_quant64_rdna2(torch::Tensor x, torch::Tensor col_scale,
+                                      torch::Tensor had, bool transform,
+                                      torch::Tensor xq, torch::Tensor sx,
+                                      torch::Tensor sq16);
+void rdna_hint_flex_i8gemm_rdna2(
+    torch::Tensor xq, torch::Tensor sx, torch::Tensor sq16, torch::Tensor codes,
+    torch::Tensor code_off, torch::Tensor blk_params, torch::Tensor param_off,
+    torch::Tensor row_consts, torch::Tensor row_nbits, torch::Tensor row_block,
+    torch::Tensor out, int64_t tile);
+void rdna_hint_flex_moe_transform_rdna2(torch::Tensor x, int64_t src_div,
+                                        torch::Tensor expert,
+                                        torch::Tensor col_scale,
+                                        torch::Tensor had, bool transform,
+                                        torch::Tensor out);
+void rdna_hint_flex_moe_gemm_rdna2(
+    torch::Tensor x, torch::Tensor sorted_ids, torch::Tensor expert_ids,
+    torch::Tensor ntpp, torch::Tensor codes, torch::Tensor code_off,
+    torch::Tensor blk_params, torch::Tensor param_off, torch::Tensor row_consts,
+    torch::Tensor row_nbits, torch::Tensor row_block, int64_t n_out,
+    torch::Tensor out);

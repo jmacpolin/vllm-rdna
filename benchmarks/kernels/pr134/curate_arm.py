@@ -64,6 +64,14 @@ SERVE_EVIDENCE_PATTERNS = (
     "[rocm.py:766]",  # the attention backend selection
     "[kv_cache_utils.py:2469]",  # the KV cache size and max concurrency
     "[metrics.py:120]",  # the speculative decoding metrics
+    # The scheduling levers the arm ran with: the mamba state block (which
+    # sets the attention block and the prefill budget), the budget the
+    # server actually used, the decode-stall cap, and the W4A8 kernel
+    # announcing that its fast path is live.
+    "Mamba prefix checkpoints",
+    "[vllm.py:2380]",  # max_num_scheduled_tokens as the server set it
+    "Decode stall bound",
+    "w4a8_sdot4_rdna2.hip",
 )
 
 

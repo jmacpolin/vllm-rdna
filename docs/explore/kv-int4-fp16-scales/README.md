@@ -509,13 +509,14 @@ backend is the one that writes and reads it natively, in the FA kernel itself.
 | --- | --- | --- |
 | `RDNA_ATTN` (gfx1030, Qwen3.x-style text models) | yes, native read and write | the FA-RDNA2 kernels dequantise in registers and keep the FP16 dot |
 | `TRITON_ATTN` | no | no Triton kernel packs the record, so the backend refuses the dtype up front (`vllm/v1/attention/backends/triton_attn.py`) |
-| `QWEN4_EXP_QSA_TRITON` (Qwen4Exp, Flash-Next) | no | the QSA owner reads the main KV cache as FP16/BF16 words and refuses any other cache dtype (`vllm/models/qwen4_exp/amd/qsa.py`) |
+| `QWEN4_EXP_QSA_TRITON` (Qwen4Exp, Flash-Next) | yes, native read and write | the fused packed-int4 QSA decode reads the record in registers (`vllm/models/qwen4_exp/amd/ops/qsa_rdna2.py`); the Triton QSA path still refuses the dtype |
 | `--monokernel` (Qwen4Exp MonoKernel on gfx1030) | no | the mono QSA kernels read K and V as FP16 words; the switch refuses a quantized KV cache up front (`vllm/models/qwen4_exp/amd/mono_decode_rdna2.py`) |
 
-The MonoKernel and the Qwen4Exp QSA owner are a different model family from
-the one this PR was measured on (a Qwen3.8 AWQ dense model), and their
-attention path is not `RDNA_ATTN`. INT4 KV is therefore *refused* for them,
-loudly and early, rather than being read wrongly.
+The MonoKernel is a different model family from the one this PR was measured
+on (a Qwen3.8 AWQ dense model), and its attention path is not `RDNA_ATTN`.
+INT4 KV is therefore *refused* for it, loudly and early, rather than being read
+wrongly. The Qwen4Exp QSA owner was in the same position when this table was
+written, but it has since gained a native packed-int4 decode (`2e9fe02c79`).
 
 ## The INT8 backport: what it actually costs
 
@@ -530,9 +531,10 @@ kernel work.
 
 What is missing, and what is wrong:
 
-1. **The ops are not registered.** `fa_rdna2_prefill_paged_varlen_int8` and
-   `fa_rdna2_decode_paged_int8` are not in `csrc/rocm/torch_bindings.cpp`.
-   Only the writer is, and its comment says why. The legacy tree reached the
+1. **The ops are not wired up.** `fa_rdna2_decode_paged_int8` is not in
+   `csrc/rocm/torch_bindings.cpp`, and `fa_rdna2_prefill_paged_varlen_int8`
+   is registered only for its workspace test; the writer's registration
+   comment says why nothing calls them. The legacy tree reached the
    kernels through a `load_inline` JIT build; this tree loads them through
    `torch.ops._rocm_C`, so the registration and the
    `vllm/v1/attention/ops/fa_rdna2_backend.py` shim both have to change.
@@ -594,10 +596,10 @@ document:
   FP16 shared tile and the prefill path dequantises in VGPRs, and neither
   uses an integer dot instruction - and an INT8 writer
   (`reshape_and_cache_int8_rdna2`). In this tree it is not reachable:
-  `fa_rdna2_prefill_paged_varlen_int8` and `fa_rdna2_decode_paged_int8` are
-  not registered in `csrc/rocm/torch_bindings.cpp`, and
-  `RdnaAttentionBackend._can_run_fa_rdna2` rejects every quantised KV dtype
-  (`vllm/v1/attention/backends/rdna_attn.py:283`).
+  `fa_rdna2_decode_paged_int8` is not registered in
+  `csrc/rocm/torch_bindings.cpp` (`fa_rdna2_prefill_paged_varlen_int8` is, for
+  its workspace test only), and `RdnaAttentionBackend._can_run_fa_rdna2`
+  rejects every quantised KV dtype (`vllm/v1/attention/backends/rdna_attn.py:329`).
 
   That work is this proposal's most likely *host*, and the port is mapped in
   *The INT8 backport* above. It is also this proposal's clearest benchmark:

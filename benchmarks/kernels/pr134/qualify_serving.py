@@ -350,6 +350,44 @@ def main():
         "until its page covers the mamba page.",
     )
     parser.add_argument(
+        "--mamba-ssm-cache-dtype",
+        choices=("auto", "float32", "float16", "bfloat16"),
+        default="auto",
+        help="SSM state dtype for the mamba cache. 'auto' keeps the model's own "
+        "(float32) and leaves the server command untouched. 'float16' halves "
+        "the mamba state page, which is what the hybrid page alignment uses to "
+        "pick the attention block size.",
+    )
+    parser.add_argument(
+        "--w4a8",
+        choices=("0", "1"),
+        default=None,
+        help="Enable the int8-activation prefill GEMM path "
+        "(VLLM_RDNA2_W4A8_SDOT4=1). Prefill only: decode stays W4A16. The "
+        "default leaves the recipe's own W4A8 setting alone.",
+    )
+    parser.add_argument(
+        "--decode-stall-ms",
+        type=int,
+        default=None,
+        help="Override the decode-stall cap (VLLM_RDNA_DECODE_STALL_MS) that "
+        "bounds prefill work in steps that carry decodes. 0 disables the cap. "
+        "The default leaves the recipe's value alone.",
+    )
+    parser.add_argument(
+        "--max-num-batched-tokens",
+        type=int,
+        default=None,
+        help="max_num_batched_tokens for the server. The default follows the "
+        "attention block size the hybrid page alignment will pick: 2048 for "
+        "an FP16 KV cache (block 1024), 4096 for a packed KV cache with an "
+        "FP16 SSM state (block 2048), 6144 for a packed KV cache with the "
+        "model's own FP32 SSM state (block 3072). A prefill chunk ends on a "
+        "mamba state block boundary, so the budget must cover two blocks for "
+        "two requests to be prefilled per scheduler step; at one block per "
+        "step the long-prompt prefill drains at half the rate.",
+    )
+    parser.add_argument(
         "--gpus", default=GPUS, help="Comma-separated HIP device indices for this arm."
     )
     parser.add_argument(
@@ -358,6 +396,18 @@ def main():
         help="Execute only after source/build/layout gates pass",
     )
     args = parser.parse_args()
+    if args.max_num_batched_tokens is None:
+        # Two mamba state blocks per scheduler step, so two requests are
+        # prefilled per step. The block size the hybrid page alignment picks
+        # follows the KV cache page: a packed KV cache has a smaller
+        # attention page, so the block grows until the page covers the mamba
+        # state page (2048 with an FP16 SSM state, 3072 with FP32).
+        if args.cache_dtype == "auto":
+            args.max_num_batched_tokens = 2048
+        elif args.mamba_ssm_cache_dtype == "float16":
+            args.max_num_batched_tokens = 4096
+        else:
+            args.max_num_batched_tokens = 6144
     gpus = args.gpus
     assert os.environ.get("HIP_VISIBLE_DEVICES") == gpus, (
         f"HIP_VISIBLE_DEVICES={os.environ.get('HIP_VISIBLE_DEVICES')!r} "
@@ -385,9 +435,35 @@ def main():
         PYTORCH_TUNABLEOP_HIPBLASLT_ENABLED="0",
         TUNEOP_REQUIRE_HASH_ROWS="1",
     )
+    # The two serving levers the recipe exposes. Both are environment knobs
+    # read before the server starts, so they are pinned here to keep an arm
+    # self-contained: the caller's environment cannot leak into it.
+    knobs = {
+        "w4a8": "recipe" if args.w4a8 is None else args.w4a8,
+        "decode_stall_ms": (
+            "recipe" if args.decode_stall_ms is None else args.decode_stall_ms
+        ),
+    }
+    if args.w4a8 is None:
+        # No override: drop any inherited value so the recipe's own W4A8
+        # setting governs the arm.
+        env.pop("VLLM_RDNA2_W4A8_SDOT4", None)
+    else:
+        env["VLLM_RDNA2_W4A8_SDOT4"] = args.w4a8
+    if args.decode_stall_ms is None:
+        # No override: drop any inherited value so the recipe's own setting
+        # (VLLM_RDNA_DECODE_STALL_MS) governs the arm.
+        env.pop("VLLM_RDNA_DECODE_STALL_MS", None)
+    else:
+        env["VLLM_RDNA_DECODE_STALL_MS"] = str(args.decode_stall_ms)
     features = "prefix-caching mamba-align language-model-only skip-mm-profiling"
     if args.recipe == "flashnext-mtp2":
         features += " expert-parallel"
+    # Only pass the SSM dtype when it is not the model's own: the control arm
+    # must run the same server command as the arm it is compared against.
+    extra_args = f"--kv-cache-dtype {args.cache_dtype} --seed 12345"
+    if args.mamba_ssm_cache_dtype != "auto":
+        extra_args += f" --mamba-ssm-cache-dtype {args.mamba_ssm_cache_dtype}"
     command = [
         "bash",
         TREE / "tools/rdna/serve_rdna.sh",
@@ -404,7 +480,7 @@ def main():
         "MTP=2",
         "SEQS=8",
         f"MAXLEN={args.max_model_len}",
-        "MAXBAT=2048",
+        f"MAXBAT={args.max_num_batched_tokens}",
         f"KV={args.kv_bytes}",
         f"BLOCK_SIZE={args.block_size}",
         f"GPU_MAX_HW_QUEUES={args.hw_queues}",
@@ -415,7 +491,7 @@ def main():
         f"VLLM_CACHE_ROOT={args.output}/cache/vllm",
         f"TRITON_CACHE_DIR={args.output}/cache/triton",
         f"TORCHINDUCTOR_CACHE_DIR={args.output}/cache/inductor",
-        f"EXTRA_ARGS=--kv-cache-dtype {args.cache_dtype} --seed 12345",
+        f"EXTRA_ARGS={extra_args}",
     ]
     if not args.run:
         print(
@@ -478,7 +554,6 @@ def main():
             "MTP",
             "SEQS",
             "MAXLEN",
-            "MAXBAT",
             "KV",
             "BLOCK_SIZE",
             "GPU_MAX_HW_QUEUES",
@@ -491,7 +566,20 @@ def main():
             assert reference_args[key] == current_args[key], (
                 f"reference configuration differs: {key}"
             )
+        # MAXBAT is deliberately not a pairing constraint: the budget is
+        # derived from the attention block size, which the hybrid page
+        # alignment picks per KV dtype (1024 for FP16 KV, 2048 for a packed
+        # KV cache with an FP16 SSM state, 3072 with FP32). A packed
+        # candidate and its FP16 reference therefore carry different budgets
+        # for the same requested block size. The invariant that matters is
+        # per arm: the budget must cover two mamba state blocks, which the
+        # server log assertion above enforces on both arms.
         assert reference_run["kv_cache_layout"] == args.layout
+        assert reference_run.get("knobs") == knobs, (
+            "reference levers differ: "
+            f"{reference_run.get('knobs')} != {knobs}; the paired PPL check "
+            "would compare two different server configurations"
+        )
         assert reference_run["boot_id"] == boot_id()
         assert (
             json.loads((args.reference / "manifest.before.json").read_text())
@@ -521,6 +609,7 @@ def main():
             "cache_dtype": args.cache_dtype,
             "kv_cache_layout": args.layout,
             "recipe": args.recipe,
+            "knobs": knobs,
             "model": str(args.model),
             "reference": str(args.reference) if args.reference else None,
             "reference_mode": reference_mode,
@@ -564,6 +653,25 @@ def main():
         assert re.search(r"[Cc]aptur", text), "graph capture not evidenced"
         if args.cache_dtype != "auto":
             assert args.cache_dtype in text, "packed dtype not evidenced"
+        # The mamba block-aligned prefill split ends every prefill chunk on a
+        # mamba state block boundary, so a scheduler step carries whole blocks.
+        # With a per-step budget of one block only one request is prefilled
+        # per step and the long-prompt prefill drains at half the rate
+        # (gfx1030, 27B AWQ, 16k x c=8: 42.2 -> 37.4 tok/s, TTFT 50.7 ->
+        # 103.3 s at block 2048, per-token prefill cost unchanged). Refuse
+        # an arm that cannot cover two blocks: it would look like a kernel
+        # regression rather than a scheduling cliff.
+        state_block = re.search(r"state_block=(\d+)", text)
+        scheduled = re.search(r"max_num_scheduled_tokens is set to (\d+)", text)
+        assert state_block and scheduled, "mamba state block size not evidenced"
+        state_block = int(state_block.group(1))
+        scheduled = int(scheduled.group(1))
+        assert scheduled >= 2 * state_block, (
+            f"max_num_scheduled_tokens={scheduled} cannot cover two mamba "
+            f"state blocks of {state_block} tokens; the block-aligned prefill "
+            f"split would prefill one request per step. Raise "
+            f"--max-num-batched-tokens to at least {2 * state_block}."
+        )
         for name, script, extra in (
             ("greedy", "tools/probe_greedy_correctness.py", ["--max-tokens", "48"]),
             ("ppl", "tools/rdna/port_v031/ppl_probe.py", ["--max-ppl", "6"]),

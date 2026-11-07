@@ -246,6 +246,14 @@ class RdnaAttentionMetadataBuilder(AttentionMetadataBuilder[RdnaAttentionMetadat
         common_attn_metadata.query_start_loc.zero_()
         return attn_metadata
 
+    def update_draft_decode_metadata(self, _metadata: RdnaAttentionMetadata) -> None:
+        # Draft decode steps (one query per request) advance seq_lens,
+        # slot_mapping and block_table in the persistent common buffers that
+        # the metadata already references, so there is nothing to refresh.
+        # max_seq_len is only read by the prefill kernels, never by the
+        # split-K decode path the draft steps use.
+        pass
+
 
 class RdnaAttentionImpl(AttentionImpl):
     def __init__(
@@ -566,7 +574,7 @@ class RdnaAttentionImpl(AttentionImpl):
             # There is deliberately no row-count gate here. The prefill
             # kernel has no split-K over the KV range, so a decode row routed
             # through it gets one CTA that walks the whole context: at a 16k
-            # context that is a handful of CTAs on a 36-CU GPU. The decode
+            # context that is a handful of CTAs on a 72-CU GPU. The decode
             # kernel splits the KV range 16 ways, so it stays occupied
             # whatever the batch size. Gating the split on the row count
             # therefore turned a high-concurrency batch into a streaming
@@ -720,6 +728,7 @@ class RdnaAttentionImpl(AttentionImpl):
                 self.kv_cache_dtype,
                 layer._k_scale,
                 layer._v_scale,
+                False,  # interleaved_v: the RDNA backend uses the plain V layout
             )
         else:
             # The native writer assumes densely packed blocks and corrupts
