@@ -73,4 +73,7 @@ if [[ ${PYTORCH_TUNABLEOP_ENABLED:-0} == 1 ]]; then
 fi
 "$runtime/.venv/bin/python" -c 'import vllm; print(vllm.__file__)'
 cd "$source_dir"
-exec "${command[@]}"
+# Serving stops at 90 °C (THERMAL_ABORT_C; rdna_launcher_common.sh).
+# shellcheck source=tools/rdna/rdna_launcher_common.sh
+source "$source_dir/tools/rdna/rdna_launcher_common.sh"
+rdna_serve_guarded "${command[@]}"

@@ -1,9 +1,15 @@
 #!/usr/bin/env bash
 # PR134 same-boot paired qualification on par1-cs25 (192.168.1.84).
 #
-# Usage: pr134-27b-pair.sh <gpus> <suffix>
+# Usage: pr134-27b-pair.sh <gpus> <suffix> [qualify_serving.py args...]
 #   <gpus>   comma-separated HIP indices, e.g. 6,7,8,9
 #   <suffix> output-dir suffix, e.g. hip6789
+#   args     extra qualify_serving.py flags, applied to BOTH arms so the pair
+#            differs only in the KV cache dtype. Use them to pin the serving
+#            levers under test:
+#              --w4a8 1                          int8-activation prefill GEMMs
+#              --decode-stall-ms 0               disable the decode-stall cap
+#              --mamba-ssm-cache-dtype float16   fp16 mamba state
 #
 # Arm 1: FP16 reference (cache-dtype auto) on the current boot.
 # Arm 2: INT4 candidate (cache-dtype int4_fp16_block) against that reference.
@@ -15,8 +21,9 @@
 # diagnostic-only with contaminated hardware attribution.
 set -uo pipefail
 
-gpus=${1:?usage: $0 <gpus> <suffix>}
-suffix=${2:?usage: $0 <gpus> <suffix>}
+gpus=${1:?usage: $0 <gpus> <suffix> [args...]}
+suffix=${2:?usage: $0 <gpus> <suffix> [args...]}
+shift 2
 
 readonly results=/home/chenco_adm/pr134-results
 readonly tree=/home/chenco_adm/vllm-pr-int4fp16
@@ -26,7 +33,10 @@ readonly core_tag=$(sha256sum "$tree/vllm/_rocm_C.abi3.so" | cut -c1-8)
 readonly reference=$results/serve-27b-fp16-core$core_tag-$suffix
 readonly candidate=$results/serve-27b-int4-core$core_tag-$suffix
 readonly stop_marker=$results/stop-qualification
-readonly model=/home/chenco_adm/.cache/huggingface/hub/models--cyankiwi--Qwen3.8-27B-AWQ-INT4/snapshots/63768c10df38c0395e12ef49edac1bd539eaeeea
+# PR134_MODEL overrides the served model directory. The HF cache snapshot of
+# this model lost its directory entry after the host reboot (a stale XFS
+# entry), so the campaign runs against a repaired copy of the same blobs.
+readonly model=${PR134_MODEL:-/home/chenco_adm/.cache/huggingface/hub/models--cyankiwi--Qwen3.8-27B-AWQ-INT4/snapshots/63768c10df38c0395e12ef49edac1bd539eaeeaa}
 
 cd "$tree" || exit 10
 export HIP_VISIBLE_DEVICES=$gpus
@@ -35,7 +45,7 @@ unset CUDA_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES
 log() { printf '[%s] %s\n' "$(date -Is)" "$*"; }
 
 common=(--model "$model" --recipe 27b-awq --layout LBHNC --kv-bytes 8000000000
-        --hw-queues 2 --port 18134 --gpus "$gpus" --run)
+        --hw-queues 2 --port 18134 --gpus "$gpus" --run "$@")
 
 arm1=(benchmarks/kernels/pr134/qualify_serving.py "${common[@]}" --cache-dtype auto
       --output "$reference")

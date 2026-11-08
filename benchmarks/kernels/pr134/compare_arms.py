@@ -112,7 +112,6 @@ def check_pairable(reference, candidate):
         "MTP",
         "SEQS",
         "MAXLEN",
-        "MAXBAT",
         "KV",
         "BLOCK_SIZE",
         "GPU_MAX_HW_QUEUES",
@@ -124,6 +123,12 @@ def check_pairable(reference, candidate):
     ):
         if ref_cmd.get(key) != cand_cmd.get(key):
             problems.append(f"config {key} differs")
+    # MAXBAT is deliberately not compared: the prefill budget is derived from
+    # the attention block size, which the hybrid page alignment picks per KV
+    # dtype (1024 for FP16 KV, 2048 for a packed KV cache with an FP16 SSM
+    # state). A packed candidate and its FP16 reference therefore carry
+    # different budgets for the same requested block size, and the invariant
+    # that matters is per arm: the budget must cover two mamba state blocks.
     for key in ("status", "cleanup"):
         if reference["status"].get(key) != "PASS":
             problems.append(f"reference raw {key} is {reference['status'].get(key)}")
