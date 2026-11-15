@@ -372,6 +372,18 @@ def test_layout_tables_follow_the_documented_layouts_of_core() -> None:
             assert set(mine.key_buses(key)) == set(members), (core.name, letter)
 
 
+def test_v620_experimentation_layouts() -> None:
+    # four V620 behind one PEX880xx, one key; the buses follow the CPU population
+    for buses in (("64", "69", "6f", "72"), ("b1", "b6", "bc", "bf")):
+        lay = hw.layout_of_box(buses)
+        assert lay in (hw.V620_X4, hw.V620_X4_1S)
+        assert lay.key_names == ("v620x4",) and set(lay.key_buses("v620x4")) == set(buses)
+        assert lease.lease_key(buses[0], lay) == "v620x4"
+        assert hw.layout_of_buses(buses[:1]) is lay  # no other layout knows these buses
+    assert hw.layout_of_box(["64", "69"]) is hw.NO_LAYOUT  # a subset is not the box
+    assert "v620x4" in hw.all_keys()
+
+
 def test_interim_layout_is_the_lease_readme_of_2026_11_10() -> None:
     assert hw.INTERIM.keys == (("a2", ("d1", "d4")), ("b4", ("d9", "dc", "df", "e2")))
     assert hw.INTERIM.lead_only == ()  # no W7800 is installed

@@ -19,6 +19,15 @@ the same commit that follows the README of the box.
   ``slotB`` = V620 ``0a 0f 14 17`` (switch B, HIP 6-9), ``w7800cb`` = W7800 ``cb``
   (HIP 0), ``w7800-07`` = W7800 ``07`` (HIP 5, never without the lead).
 
+* ``V620_X4`` and ``V620_X4_1S`` (jmacpolin/v620-Experimentation, not par1-cs25):
+  four V620 behind one Broadcom PEX880xx (``1000:c010``) on a dual-socket Dell
+  workstation, one lease key ``v620x4`` for all four. The buses follow the CPU
+  population: ``64 69 6f 72`` with two Xeon Gold 6144 (since 2026-10-11),
+  ``b1 b6 bc bf`` with one (before). Source: that repository's
+  ``builds/v620-cards.tsv`` (rocm-smi inventories, HIP order = bus order) and
+  ``docs/topology.md``. Its ``tools/pciescope.sh`` holds the key while no engine
+  runs (its one-engine-on-the-GPUs rule stands in for the lease README).
+
 HIP indices change with the enumeration; they are only the expectation the
 probe verifies at run time (``p2p_probe buses``).
 """
@@ -85,7 +94,20 @@ TEN_GPU = Layout(
     lead_only=(("w7800-07", "W7800 bus 07 (HIP 5): NEVER without the lead"),),
 )
 
-LAYOUTS: tuple[Layout, ...] = (INTERIM, TEN_GPU)  # newest first
+V620_X4 = Layout(
+    "four V620 behind one PEX880xx (v620-Experimentation, 2x Xeon 6144)",
+    keys=(("v620x4", ("64", "69", "6f", "72")),),
+    slot_keys=(("A", "v620x4"),),
+)
+
+V620_X4_1S = Layout(
+    "four V620 behind one PEX880xx (v620-Experimentation, 1x Xeon 6144)",
+    keys=(("v620x4", ("b1", "b6", "bc", "bf")),),
+    slot_keys=(("A", "v620x4"),),
+)
+
+# par1-cs25's layouts newest first, then other boxes' (a bus set selects one layout)
+LAYOUTS: tuple[Layout, ...] = (INTERIM, TEN_GPU, V620_X4, V620_X4_1S)
 
 # Nothing is covered: the layout of a box whose GPU buses match no documented one.
 NO_LAYOUT = Layout("no documented layout matches the GPUs of this box", (), ())

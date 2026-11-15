@@ -102,6 +102,18 @@ DOCUMENTED_LAYOUTS: tuple[BoxLayout, ...] = (
         ("cb", "ce", "d3", "d8", "db", "07", "0a", "0f", "14", "17"),
         (("A", ("ce", "d3", "d8", "db")), ("B", ("0a", "0f", "14", "17"))),
     ),
+    # jmacpolin/v620-Experimentation: four V620 behind one PEX880xx, lease v620x4
+    # (probe/hw.py); the buses follow the CPU population (builds/v620-cards.tsv there)
+    BoxLayout(  # two Xeon Gold 6144 (since 2026-10-11)
+        "four V620 behind one PEX880xx (v620-Experimentation, 2x Xeon 6144)",
+        ("64", "69", "6f", "72"),
+        (("A", ("64", "69", "6f", "72")),),
+    ),
+    BoxLayout(  # one Xeon Gold 6144 (until 2026-10-11)
+        "four V620 behind one PEX880xx (v620-Experimentation, 1x Xeon 6144)",
+        ("b1", "b6", "bc", "bf"),
+        (("A", ("b1", "b6", "bc", "bf")),),
+    ),
 )
 
 
