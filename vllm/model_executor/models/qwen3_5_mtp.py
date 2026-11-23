@@ -12,9 +12,6 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group, tensor_model_parallel_all_gather
 from vllm.logger import init_logger
-from vllm.model_executor.layers.fused_moe.utils import (
-    is_model_fused_shared_expert_compatible,
-)
 from vllm.model_executor.layers.linear import ColumnParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -31,6 +28,9 @@ from vllm.model_executor.models.qwen3_next import (
     Qwen3NextSparseMoeBlock,
     QwenNextMixtureOfExperts,
 )
+from vllm.model_executor.models.qwen3_next_mtp import (
+    should_torch_compile_mtp_drafter,
+)
 from vllm.model_executor.models.utils import sequence_parallel_chunk
 from vllm.sequence import IntermediateTensors
 
@@ -44,6 +44,7 @@ from .utils import (
     AutoWeightsLoader,
     PPMissingLayer,
     _merge_multimodal_embeddings,
+    get_fused_shared_expert_layers,
     make_empty_intermediate_tensors_factory,
     maybe_fuse_shared_experts,
     maybe_prefix,
@@ -63,6 +64,8 @@ _QUANT_PARAM_SUFFIXES = (
     ".trellis",
     ".suh",
     ".svh",
+    # rdna_hint_flex (HI2): every quantized linear stores a ``.hi2_codes``.
+    ".hi2_codes",
 )
 
 
@@ -70,8 +73,9 @@ def _mtp_weights_unquantized(model_config) -> bool:
     """Whether the checkpoint stores its mtp.* tensors unquantized despite
     the model carrying a quant config.
 
-    Quantized params use packed names (.qweight/.qzeros/...) or EXL3's
-    trellis/suh/svh; unquantized ones are plain .weight or bare fused-MoE
+    Quantized params use packed names (.qweight/.qzeros/...), EXL3's
+    trellis/suh/svh or rdna_hint_flex's .hi2_codes; unquantized ones are plain
+    .weight or bare fused-MoE
     names (experts.gate_up_proj / experts.down_proj). Returns False when the
     checkpoint has no mtp tensors at all or metadata is unavailable.
     """
@@ -100,7 +104,8 @@ def _mtp_weights_unquantized(model_config) -> bool:
         "intermediate_tensors": 0,
         "inputs_embeds": 0,
         "hidden_states": 0,
-    }
+    },
+    enable_if=should_torch_compile_mtp_drafter,
 )
 class Qwen3_5MultiTokenPredictor(nn.Module):
     hf_to_vllm_mapper = Qwen3_5Model.hf_to_vllm_mapper
@@ -171,10 +176,10 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
             for idx in range(self.num_mtp_layers)
         )
         vllm_config.quant_config = original_quant
-        self.is_fused_shared_expert_enabled = is_model_fused_shared_expert_compatible(
-            self.layers,
+        self.fused_shared_expert_layers = get_fused_shared_expert_layers(
+            self,
             Qwen3NextSparseMoeBlock,
-            "mlp",
+            enable_eplb=vllm_config.parallel_config.enable_eplb,
         )
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
@@ -240,7 +245,7 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         weights = maybe_fuse_shared_experts(
             weights,
-            enabled=self.is_fused_shared_expert_enabled,
+            fused_shared_expert_layers=self.fused_shared_expert_layers,
             n_routed_experts=getattr(self.config, "num_experts", 0),
             n_shared_experts=1,
             ckpt_prefix="mlp.shared_expert",
@@ -258,7 +263,8 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         "intermediate_tensors": 0,
         "inputs_embeds": 0,
         "hidden_states": 0,
-    }
+    },
+    enable_if=should_torch_compile_mtp_drafter,
 )
 class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
     packed_modules_mapping = {
@@ -332,10 +338,15 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
         hidden_states: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
-        **kwargs: object,
+        spec_step_idx: int = 0,
     ):
         hidden_states = self.model(
-            input_ids, positions, hidden_states, intermediate_tensors, inputs_embeds
+            input_ids,
+            positions,
+            hidden_states,
+            intermediate_tensors,
+            inputs_embeds,
+            spec_step_idx,
         )
         return hidden_states
 
@@ -345,6 +356,14 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
         spec_step_idx: int = 0,
     ) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
+
+    def get_top_tokens(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
+        # One lm_head is shared by all MTP modules, as in compute_logits.
+        return super().get_top_tokens(hidden_states)
 
     def is_unused_checkpoint_weight(self, name: str) -> bool:
         return not name.startswith("mtp.") and not any(

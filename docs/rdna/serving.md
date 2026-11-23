@@ -29,6 +29,7 @@ ROCm variables, `VLLM_*`, `HSA_*`, `NCCL_*` / `RCCL_*`, and vLLM serve flags bel
 | Flash-Next AWQ-W4A16, same parsers, no MTP | [`flashnext`](../../tools/rdna/recipes/flashnext.env) | TP=4 | `0.0.0.0:18094`, name `flash-next` |
 | Flash-Next AWQ, plain decode, 262144 context | [`flashnext-mtp0`](../../tools/rdna/recipes/flashnext-mtp0.env) | TP=4 | `127.0.0.1:18096`, name `flash-next` |
 | Flash-Next AWQ, MTP=2 | [`flashnext-mtp2`](../../tools/rdna/recipes/flashnext-mtp2.env) | TP=4 | `127.0.0.1:18096`, name `flash-next` |
+| Flash-Next UD-Q4_K_XL GGUF, plain decode, text only (needs `GGUF_DIR`) | [`flashnext-gguf-mtp0`](../../tools/rdna/recipes/flashnext-gguf-mtp0.env) | TP=4 | `127.0.0.1:18096`, name `flash-next` |
 | Flash-Next AWQ, lossy LeapQuant GDN, 512-token blocks, MTP=2 + MonoKernel | [`flashnext-leapquant-mtp2`](../../tools/rdna/recipes/flashnext-leapquant-mtp2.env) | TP=4 | `127.0.0.1:18096`, name `flash-next` |
 | Flash-Next AWQ + Inco DFlash2 | [`flashnext-dflash2`](../../tools/rdna/recipes/flashnext-dflash2.env) | TP=4 | `127.0.0.1:18096`, name `flash-next` |
 | Flash-Next AWQ on 3 cards, no MTP | [`flashnext-pp3`](../../tools/rdna/recipes/flashnext-pp3.env) | TP=1, PP=3 | `127.0.0.1:18096`, name `flash-next` |
@@ -37,6 +38,8 @@ ROCm variables, `VLLM_*`, `HSA_*`, `NCCL_*` / `RCCL_*`, and vLLM serve flags bel
 | Flash-Next AWQ, MTP=2, two pipeline stages of four cards | [`flashnext-tp4pp2-mtp2`](../../tools/rdna/recipes/flashnext-tp4pp2-mtp2.env) | TP=4, PP=2 | `127.0.0.1:18099`, name `flash-next` |
 | Qwen3.8-27B AWQ, W4A8 prefill | [`27b-awq`](../../tools/rdna/recipes/27b-awq.env) | TP=4 | `127.0.0.1:18210`, name `q27d` |
 | Qwen3.8-27B EXL3, codebook `mul1` | [`27b-exl3`](../../tools/rdna/recipes/27b-exl3.env) | TP=4 | `127.0.0.1:18105`, name `exl3-27b-mul1` |
+| Qwen3.8-27B HI2 3.0 bpw (`rdna_hint_flex`), two cards | [`27b-hi2-tp2`](../../tools/rdna/recipes/27b-hi2-tp2.env) | TP=2 | `127.0.0.1:18211`, name `q27hi2` |
+| Qwen3.8-27B HI2 3.0 bpw, two cards, MTP=2 (one to four concurrent requests) | [`27b-hi2-tp2-mtp2`](../../tools/rdna/recipes/27b-hi2-tp2-mtp2.env) | TP=2 | `127.0.0.1:18211`, name `q27hi2` |
 | DeepSeek-V4-Flash, K128 | [`dsv4-flash`](../../tools/rdna/recipes/dsv4-flash.env) | TP=4 | `127.0.0.1:18300`, name `dsv4-flash` |
 | HIP graphs, breakable capture, TP=2 | [`full`](../../tools/rdna/recipes/full.env) | TP=2 | launcher omits `--host`; port `18094`; no served name |
 
@@ -66,10 +69,11 @@ From [`rdna_launcher_common.sh`](../../tools/rdna/rdna_launcher_common.sh), unle
 | `VLLM_WORKER_MULTIPROC_METHOD` | `spawn` | Leave it. |
 | `ROCPROFILER_REGISTER_ENABLED` | `0` | Set `1` only while attaching a GPU profiler. |
 | `VLLM_BATCH_INVARIANT` | `0` | Leave it for serving. |
-| `VLLM_CACHE_ROOT` and the Triton / Inductor / extension caches | `<repo>/cache/...` | Stale `vllm serve` processes are killed only when they carry the same `VLLM_CACHE_ROOT`. |
+| `VLLM_CACHE_ROOT` | `<repo>/cache/vllm-<HIP_VISIBLE_DEVICES, commas as _>-<PORT>` | Stale `vllm serve` processes are killed only when they carry the same `VLLM_CACHE_ROOT`. The default is per GPU set and port, so two servers of one checkout on different cards boot side by side without killing each other (a relaunch on the same cards and port still replaces its predecessor). An explicit `VLLM_CACHE_ROOT` is used as given: every server carrying that exact root is stopped at launch, so give parallel servers different roots. |
+| Triton / Inductor / extension caches | `<repo>/cache/...` | Shared by the servers of one checkout. |
 | `PYTHONPATH` | the repo root | So this checkout wins over an installed copy. |
 
-The command always includes `--dtype float16`. `TUNABLEOP` defaults to `1`: the launcher hashes `librocblas.so.5` and selects a profile under [`tunableop/`](../../tunableop/). `TUNABLEOP=0` turns that off. `TUNABLEOP_PROFILE=<name>` forces a named profile and refuses to start when the name is missing. `P2P=0` turns the RDNA all-reduce off and sets `NCCL_P2P_DISABLE=1` (RCCL over host shared memory) for a host whose PCIe peer-to-peer is broken.
+The command always includes `--dtype float16`. `TUNABLEOP` defaults to `1`: the launcher hashes `librocblas.so.5` and selects a profile under [`tunableop/`](../../tunableop/). `TUNABLEOP=0` turns that off. `TUNABLEOP_PROFILE=<name>` forces a named profile and refuses to start when the name is missing. `TUNABLEOP_PREFER=<name>` is the soft form: it applies only when that profile is registered for the loaded library's hash, otherwise the launcher warns and auto-selects (recipes `27b-hi2-tp2` and `27b-hi2-tp2-mtp2` set it to their opt-in derived profile; `TUNABLEOP_PREFER=` empty gives the canonical rows). `P2P=0` turns the RDNA all-reduce off and sets `NCCL_P2P_DISABLE=1` (RCCL over host shared memory) for a host whose PCIe peer-to-peer is broken.
 
 `EXTRA_ARGS` is appended to the command. Example: `EXTRA_ARGS=--monokernel`. Quote it; the launcher splits it on spaces.
 
@@ -91,6 +95,7 @@ These are shell variables in the `.env` files. They become flags. They are not e
 | `MAXLEN` | `--max-model-len`. Empty uses the model's own context. | Lower it when KV memory is tight. |
 | `MIN_MAXLEN` | Refuse to start when `MAXLEN` is set below this. | `full` sets 32768. |
 | `BLOCK_SIZE` | `--block-size`. | 1024 on Flash-Next and 27B recipes, except 512 on `flashnext-leapquant-mtp2`; 16 on `full`. |
+| `REPLAYSSM_STATE_DTYPE` | `--replayssm-state-dtype`. Empty passes no flag (`auto`: the model's own GDN state). `leapquant` stores the GDN state as an INT8 blob: lossy, gfx10x only. It replaces the environment variable `VLLM_RDNA_GDN_LEAPQUANT`; the launcher stops when that variable is `1`, because the engine no longer reads it. | `leapquant` on `flashnext-leapquant-mtp2` only. See [LeapQuant config guards](../rdna2/leapquant-config-guards-2026-11-14.md). |
 | `SEQS` | `--max-num-seqs`. | Lower it when a long context does not fit. |
 | `MAXBAT` | `--max-num-batched-tokens`. Empty: the launcher derives it from the KV and SSM dtypes (2048 for an FP16 KV cache, 4096 for `int4_fp16_block` with an FP16 SSM state, 6144 with the model's FP32 SSM state). A prefill chunk ends on a mamba block, so the budget covers two blocks. | Leave `27b-awq` empty. Pinning it puts a packed KV cache back on a one-block budget (see that recipe). |
 | `LPTH` | `--long-prefill-token-threshold`. `0` disables the long-prefill split. | The recipes that set it use 0. |
@@ -108,7 +113,7 @@ These are shell variables in the `.env` files. They become flags. They are not e
 | `PLE_QUANT_DIR` | Directory of an INT4 PLE table (`META.json` required). | Required for `PLE=int4` and `PLE=int4-disk`. |
 | `TUNED_CONFIG` | `1` sets `VLLM_TUNED_CONFIG_FOLDER` to `<repo>/tuned-moe`. | On for the AWQ MoE recipes. Off for `flashnext-exl3` (those configs are the W4A16 MoE path). |
 | `ALLOC_CONF` | `expandable_segments` true, false, or `auto` (false when the PLE sidecar is on). | `full` uses `auto`. |
-| `REQUIRED_VARS` | Names that must already be set or the launch stops. | No current recipe sets it. |
+| `REQUIRED_VARS` | Names that must already be set or the launch stops. | `flashnext-gguf-mtp0` sets `GGUF_DIR`. |
 
 ### `FEATURES` tokens
 
@@ -176,7 +181,7 @@ Where a recipe sets these, the value is the one below. A later section names the
 | `PYTHONFAULTHANDLER` | `1` | Same recipes as `OMP_NUM_THREADS`. |
 | `VLLM_CAUSAL_CONV1D_RDNA2_FWD`, `VLLM_CAUSAL_CONV1D_RDNA2_UPDATE` | `0` | HIP causal conv1d off; Triton stays. Set by every Flash-Next recipe and by `27b-awq`. The tuning guide's code default is 1; these recipes override it. |
 | `VLLM_ENABLE_STARTUP_PLAN` | `0` | Same recipes as the causal-conv pair. |
-| `VLLM_RDNA_DENSE_INT8`, `VLLM_RDNA_DENSE_INT8_ONLY`, `VLLM_RDNA_DENSE_GEMV` | `0` on the TP=4 Flash-Next recipes and `27b-awq` | Both PP=3 recipes set `VLLM_RDNA_DENSE_INT8=1` and `VLLM_RDNA_DENSE_INT8_ONLY=1`, and leave `VLLM_RDNA_DENSE_GEMV=0`. |
+| `VLLM_RDNA_DENSE_INT8`, `VLLM_RDNA_DENSE_INT8_ONLY` | `0` on the TP=4 Flash-Next recipes and `27b-awq` | Both PP=3 recipes set these to `1`. gfx1030 FP16 decode uses the RDNA2 GEMV without a separate force switch. |
 | `VLLM_RDNA_FUSED_SE` | `1` | Fused shared expert, where the recipe sets it. `flashnext-exl3` sets `0` (EXL3 experts use `Exl3MoEMethod`). |
 | `VLLM_GDN_HIP_PREFILL` | `1` on the Flash-Next AWQ recipes | `flashnext-exl3` sets `0`. |
 | `VLLM_USE_AOT_COMPILE` | `0` and `VLLM_DISABLE_COMPILE_CACHE=1` | Per-rank JIT. Set by `flashnext-exl3`, `27b-awq`, `27b-exl3`, `dsv4-flash`, `full`. The recipe comments: a shared AOT cache replays one rank's device tensors onto the others. |
@@ -211,6 +216,17 @@ AWQ-W4A16 Flash-Next, TP=4, `SERVE_ENTRY=api`, `HOST=127.0.0.1`, `PORT=18096`, `
 
 The only difference between the two files is `MTP=0` versus `MTP=2`. The recipe comments say MTP=0 wins at 8×1k/512 c=8 and MTP=2 wins at 8×16k/1k c=8. Those runs are the ones already written up in the tuning guide.
 
+### `flashnext-gguf-mtp0`
+
+Flash-Next from the Unsloth `UD-Q4_K_XL` GGUF (104 GiB, four shards), TP=4, `MTP=0` (the file has no MTP head), text only. `SERVE_ENTRY=api`, `HOST=127.0.0.1`, `PORT=18096`, `SERVED_NAME=flash-next`. `MAXLEN=32768`, `KV=2147483648` (22 GiB of weights per card, 127,875 KV tokens), `SEQS=8`, `MAXBAT=2048`, `BLOCK_SIZE=1024`. Features: `prefix-caching mamba-align language-model-only`; no `expert-parallel`, no vision. `EXTRA_ARGS` passes `--load-format qwen4exp_gguf --model-loader-extra-config {"gguf_dir": ...}`; the recipe builds it from `GGUF_DIR` (`REQUIRED_VARS`). `MODEL` is a directory with the model's HF `config.json`, tokenizer files and chat template, not the GGUF.
+
+It needs the plugin fork `opengfx1030/vllm-gguf-plugin` (branch `rdna_extras`), built for gfx1030; the container image has it. With the PyPI plugin it still runs, correctly but with a 2.6x slower 16k prefill. Measured on 4x V620: PPL 4.80, 1k c=1 ITL 20.3 ms, 16k c=1 TTFT 8.2 s, 1k/512 c=8 186.9 tok/s. Setup, the three plugin kernel defects and the full table: [`docs/rdna2/gguf-flashnext-2026-11-16.md`](../rdna2/gguf-flashnext-2026-11-16.md).
+
+```bash
+MODEL=/path/to/hf-config-dir GGUF_DIR=/path/to/UD-Q4_K_XL VENV=/path/to/venv \
+  bash tools/rdna/serve_rdna.sh RECIPE=flashnext-gguf-mtp0
+```
+
 ### `flashnext-dflash2`
 
 AWQ-W4A16 target, external drafter `incoai/Qwen3.8-Flash-Next-DFlash2`. The drafter is not `MODEL`. Download it before serving (`HF_HUB_OFFLINE=1`). `DFLASH_TOKENS` defaults to 3 and is also written into `MTP` so the capture ladder matches the verification width. `SPEC_CONFIG` selects method `dflash`, that Hub id, and `"attention_backend":"RDNA_ATTN"`.
@@ -229,7 +245,7 @@ Export `DFLASH_TOKENS` in the shell that runs the launcher, before the command. 
 
 AWQ-W4A16, three gfx1030 cards, `TP=1`, `PP=3`, `PP_PARTITION=16,16,16`, `MTP=0`. `SERVE_ENTRY=api`, port 18096, `MAXLEN=262144`, `SEQS=8`, `MAXBAT=2048`, `KV=auto`, `GMEM=0.95`. Text only (`language-model-only skip-mm-profiling`): the recipe comment says the vision encoder sits on stage 0 and does not fit beside 16 layers.
 
-`VLLM_RDNA_DENSE_INT8=1` and `VLLM_RDNA_DENSE_INT8_ONLY=1` (the comment: keeping the fp16 copy next to the int8 shadow OOMs a stage). `VLLM_RDNA_DENSE_GEMV=0`. `TUNED_CONFIG=1`. `VLLM_GDN_HIP_PREFILL=1`, `VLLM_RDNA_FUSED_SE=1`. `HSA_ENABLE_SDMA=0` and both causal-conv variables are `0`, same as the TP=4 Flash-Next recipes. This file does not set `GPU_MAX_HW_QUEUES`.
+`VLLM_RDNA_DENSE_INT8=1` and `VLLM_RDNA_DENSE_INT8_ONLY=1` (the comment: keeping the fp16 copy next to the int8 shadow OOMs a stage). `TUNED_CONFIG=1`. `VLLM_GDN_HIP_PREFILL=1`, `VLLM_RDNA_FUSED_SE=1`. `HSA_ENABLE_SDMA=0` and both causal-conv variables are `0`, same as the TP=4 Flash-Next recipes. This file does not set `GPU_MAX_HW_QUEUES`.
 
 ```bash
 bash tools/rdna/serve_rdna.sh RECIPE=flashnext-pp3 \
@@ -276,6 +292,17 @@ bash tools/rdna/serve_rdna.sh RECIPE=27b-awq \
 Qwen3.8-27B-exl3, 3.00 bpw, codebook `mul1`, TP=4. `SERVE_ENTRY=api`, port 18105, `SERVED_NAME=exl3-27b-mul1`. `MAXLEN=20480`, `MAXBAT=2048`, `SEQS=8`, `KVCAP=6000000000`, `GMEM=0.90`. `MTP=0`, `EAGER=0`, `ATTN=fa`, `FULL_AND_PIECEWISE`. Features: `language-model-only skip-mm-profiling trust-remote-code prefix-caching mamba-align`.
 
 AOT compile off. `RDNA_AR=1` with the 64 KiB one-shot gate. RCCL for the larger messages: `NCCL_P2P_LEVEL=pxb`, `RCCL_P2P_NET_DISABLE=1`, `RCCL_P2P_BATCH_ENABLE=1`, `NCCL_PROTO=Simple`, `RCCL_MSCCL_ENABLE=0`, `VLLM_FORCE_CUSTOM_ALL_REDUCE=0`. `VLLM_RDNA_DECODE_STALL_MS=250`. `HSA_ENABLE_SDMA` is unset here. `EAGER=1` or `CG_MODE=PIECEWISE` are the overrides the recipe comment names.
+
+### `27b-hi2-tp2` and `27b-hi2-tp2-mtp2`
+
+Qwen3.8-27B HI2 3.0 bpw (`rdna_hint_flex`, `BlivionIaG/Qwen3.8-27B-HI2-3.0bpw`), dense hybrid GDN, TP=2 on two gfx1030 cards. `SERVE_ENTRY=cli`, `HOST=127.0.0.1`, `PORT=18211`, `SERVED_NAME=q27hi2`. `ATTN=fa`, `EAGER=0`, `FULL_AND_PIECEWISE`. `MAXLEN=262144`, `BLOCK_SIZE=1024`, `SEQS=8`, `MAXBAT` derived (2048), `KV=17179869184`, `GMEM=0.9`. `RDNA_AR=1` with a 256 KiB one-shot gate. Features: `prefix-caching language-model-only`. AOT compile off. `27b-hi2-tp2` is `MTP=0`; `27b-hi2-tp2-mtp2` is the same file with `MTP=2`, for up to four concurrent requests (no throughput gain at eight and a long ITL tail there).
+
+Both recipes turn on the HI2 serving switches the scoreboard measured: `RDNA_HINT_FLEX_GEMV=auto`, `VLLM_FA_RDNA2_UNFUSED_PREFILL=1`, `VLLM_RDNA_GEMMA_RESIDUAL_DIRECT=1`, `VLLM_RDNA_GDN_DECODE_INPLACE=1`, `RDNA_HINT_FLEX_FUSE_SILU=1`, `VLLM_RDNA_LM_HEAD_GEMV_MAX_M=32` and `TUNABLEOP_PREFER=rocm7.14-rocblas5.5-hi2-27b-tp2`. Every one has an opt-out value that wins when it follows `RECIPE=` or comes from the caller's environment. [`docs/rdna2/hi2-27b-tp2-serving.md`](../rdna2/hi2-27b-tp2-serving.md) is the user document: switch table, memory, limits and the measured results.
+
+```bash
+bash tools/rdna/serve_rdna.sh RECIPE=27b-hi2-tp2 \
+  MODEL=/path/to/Qwen3.8-27B-HI2-3.0bpw
+```
 
 ### `dsv4-flash`
 
@@ -329,6 +356,8 @@ To restore the defaults, remove both files, run
 ## Further reading
 
 - [`docs/rdna2/tuning.md`](../rdna2/tuning.md) — code defaults, subsystem flags, TunableOp, and the measurements already recorded there.
+- [`docs/rdna2/hi2-27b-tp2-serving.md`](../rdna2/hi2-27b-tp2-serving.md) — HI2 27B on two cards: serving guide, switch table, memory, limits and scoreboard results.
 - [`docs/rdna/monokernel/README.md`](monokernel/README.md) — MonoKernel scope on gfx1030.
 - [`docs/rdna2/mixed-batch-stall-probe.md`](../rdna2/mixed-batch-stall-probe.md) — decode-stall cap.
+- [`docs/rdna2/gguf-flashnext-2026-11-16.md`](../rdna2/gguf-flashnext-2026-11-16.md) — GGUF Flash-Next: plugin fork, the MMQ expert-bound defect, measurements.
 - [gfx1030 wiki](https://blivioniag.github.io/gfx1030-wiki/) — host setup, the ROCm pin, and the published images.

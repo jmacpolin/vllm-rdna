@@ -12,9 +12,10 @@
 #   source "$(dirname "${BASH_SOURCE[0]}")/rdna_launcher_common.sh"
 #   MODEL=/path/to/ckpt VENV=/path/to/venv
 #   rdna_init                 # tree, venv, ROCm SDK, shared vLLM env, caches
-#   rdna_tunableop            # honours TUNABLEOP=0/1, TUNABLEOP_PROFILE/ROOT
+#   rdna_tunableop            # honours TUNABLEOP=0/1, TUNABLEOP_PROFILE/PREFER/ROOT
 #   rdna_select_attention fa  # fa | triton  (sets $attention_backend)
 #   rdna_mtp_args 2           # sets $spec_args and $capture_sizes
+#   rdna_default_cache_root   # per GPU set + port VLLM_CACHE_ROOT unless you set one
 #   rdna_kill_stale           # scoped to $VLLM_CACHE_ROOT
 #   rdna_serve_guarded "${cmd[@]}"   # in place of exec: the thermal abort
 #
@@ -26,8 +27,17 @@
 #   ROCM_SDK_ROOT                (default: /opt/rocm/core-7.14)
 #   TUNABLEOP=0|1                (default: 1)
 #   TUNABLEOP_PROFILE=<name>     explicit TunableOp profile (validated)
-#   VLLM_CACHE_ROOT / TRITON_CACHE_DIR / TORCHINDUCTOR_CACHE_DIR /
+#   TUNABLEOP_PREFER=<name>      soft choice (a recipe's rows on top of the canonical
+#                                profile): used when registered for this rocBLAS build,
+#                                else auto-select; never fails a launch
+#   VLLM_CACHE_ROOT              (default: <tree>/cache/vllm-<HIP_VISIBLE_DEVICES, commas -> _>-<PORT>,
+#                                set by rdna_default_cache_root once the device list is final, so two
+#                                servers of one tree on different cards or ports never share a root;
+#                                an explicit value is used as given and rdna_kill_stale then stops
+#                                every server carrying that exact root)
+#   TRITON_CACHE_DIR / TORCHINDUCTOR_CACHE_DIR /
 #   TORCH_EXTENSIONS_DIR         (default: <tree>/cache/*)
+#   RDNA_PROC_ROOT               (default: /proc; the process table rdna_kill_stale scans, for tests)
 #   RUN_CWD                      (default: <tree>/cache/run; never /tmp)
 #   THERMAL_ABORT_C              serving stops at this GPU temperature, °C
 #                                (default and maximum 90; see rdna_serve_guarded)
@@ -94,7 +104,6 @@ rdna_init() {
     export TORCH_BLAS_PREFER_HIPBLASLT=${TORCH_BLAS_PREFER_HIPBLASLT:-0}
     export VLLM_BATCH_INVARIANT=${VLLM_BATCH_INVARIANT:-0}
 
-    export VLLM_CACHE_ROOT=${VLLM_CACHE_ROOT:-$source_dir/cache/vllm}
     export TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-$source_dir/cache/triton}
     export TORCHINDUCTOR_CACHE_DIR=${TORCHINDUCTOR_CACHE_DIR:-$source_dir/cache/inductor}
     export TORCH_EXTENSIONS_DIR=${TORCH_EXTENSIONS_DIR:-$source_dir/cache/extensions}
@@ -169,6 +178,21 @@ rdna_mtp_args() {
     fi
 }
 
+# Default VLLM_CACHE_ROOT, unique per device list and port. Call it after
+# HIP_VISIBLE_DEVICES is final (PCI_BUSES resolved) and PORT is set. rdna_kill_stale
+# only stops servers carrying this exact root, so a second boot of the same tree on
+# other cards (or another port) leaves the first one alone, while a relaunch on the
+# same cards and port still replaces its stale predecessor. An explicit
+# VLLM_CACHE_ROOT is never touched.
+rdna_default_cache_root() {
+    if [[ -z ${VLLM_CACHE_ROOT:-} ]]; then
+        local tag=${HIP_VISIBLE_DEVICES//,/_}
+        tag=${tag//[^A-Za-z0-9_.-]/_}
+        VLLM_CACHE_ROOT=$source_dir/cache/vllm-${tag}-${PORT:-18094}
+    fi
+    export VLLM_CACHE_ROOT
+}
+
 rdna_run_cwd() {
     local dir=${RUN_CWD:-$source_dir/cache/run}
     mkdir -p "$dir"
@@ -176,12 +200,12 @@ rdna_run_cwd() {
 }
 
 rdna_kill_stale() {
-    local _sig _p _sent
+    local _sig _p _sent _proc=${RDNA_PROC_ROOT:-/proc}
     for _sig in TERM KILL; do
         _sent=0
         for _p in $(pgrep -f "entrypoints.cli.main serve|entrypoints.openai.api_server|VLLM::Worker|VLLM::EngineCore|PleOffloadWorker" 2>/dev/null); do
-            [ -r "/proc/$_p/environ" ] || continue
-            if tr '\0' '\n' < "/proc/$_p/environ" 2>/dev/null | grep -q "^VLLM_CACHE_ROOT=${VLLM_CACHE_ROOT}$"; then
+            [ -r "$_proc/$_p/environ" ] || continue
+            if tr '\0' '\n' < "$_proc/$_p/environ" 2>/dev/null | grep -q "^VLLM_CACHE_ROOT=${VLLM_CACHE_ROOT}$"; then
                 if kill -"$_sig" "$_p" 2>/dev/null; then
                     _sent=1
                 fi
