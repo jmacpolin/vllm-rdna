@@ -42,9 +42,6 @@ from vllm.distributed import (
     get_pp_group,
 )
 from vllm.logger import init_logger
-from vllm.model_executor.layers.fused_moe.utils import (
-    is_model_fused_shared_expert_compatible,
-)
 from vllm.model_executor.layers.fusion.mm_input_norm import build_mm_input_norm
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm as Qwen3_5RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -100,6 +97,7 @@ from .utils import (
     WeightsMapper,
     _merge_multimodal_embeddings,
     extract_layer_index,
+    get_fused_shared_expert_layers,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_fuse_shared_experts,
@@ -272,10 +270,10 @@ class Qwen3_5Model(Qwen3NextModel):
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers, get_layer, prefix=f"{prefix}.layers"
         )
-        self.is_fused_shared_expert_enabled = is_model_fused_shared_expert_compatible(
-            self.layers,
+        self.fused_shared_expert_layers = get_fused_shared_expert_layers(
+            self,
             Qwen3NextSparseMoeBlock,
-            "mlp",
+            enable_eplb=vllm_config.parallel_config.enable_eplb,
         )
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
@@ -295,7 +293,7 @@ class Qwen3_5Model(Qwen3NextModel):
         if "moe" in self.config.model_type:
             weights = maybe_fuse_shared_experts(
                 weights,
-                enabled=self.is_fused_shared_expert_enabled,
+                fused_shared_expert_layers=self.fused_shared_expert_layers,
                 n_routed_experts=self.config.num_experts,
                 n_shared_experts=1,
                 ckpt_prefix="mlp.shared_expert",
@@ -407,6 +405,7 @@ class Qwen3_5ForCausalLMBase(
             vllm_config.model_config.dtype,
             vllm_config.cache_config.mamba_cache_dtype,
             vllm_config.cache_config.mamba_ssm_cache_dtype,
+            replayssm_state_dtype=vllm_config.cache_config.replayssm_state_dtype,
         )
 
     @classmethod
@@ -429,6 +428,7 @@ class Qwen3_5ForCausalLMBase(
             hf_config.linear_value_head_dim,
             hf_config.linear_conv_kernel_dim,
             num_spec,
+            replayssm_state_dtype=vllm_config.cache_config.replayssm_state_dtype,
         )
 
     @classmethod
@@ -644,6 +644,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
             vllm_config.model_config.dtype,
             vllm_config.cache_config.mamba_cache_dtype,
             vllm_config.cache_config.mamba_ssm_cache_dtype,
+            replayssm_state_dtype=vllm_config.cache_config.replayssm_state_dtype,
         )
 
     @classmethod
@@ -666,6 +667,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
             hf_config.linear_value_head_dim,
             hf_config.linear_conv_kernel_dim,
             num_spec,
+            replayssm_state_dtype=vllm_config.cache_config.replayssm_state_dtype,
         )
 
     @classmethod
