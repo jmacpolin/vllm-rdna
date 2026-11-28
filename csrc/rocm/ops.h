@@ -43,6 +43,15 @@ at::Tensor gemv_f16_rdna2(const at::Tensor& x, const at::Tensor& w,
 at::Tensor gemv_i8_rdna2(const at::Tensor& x, const at::Tensor& w,
                          const at::Tensor& scale,
                          const std::optional<at::Tensor>& bias);
+at::Tensor gemm_w8a8_i8_rdna2(const at::Tensor& x, const at::Tensor& w_i8,
+                              const at::Tensor& w_scale,
+                              const std::optional<at::Tensor>& bias,
+                              int64_t design);
+at::Tensor rdna_hc_up_gate_mix_prefill_i8(const at::Tensor& dai,
+                                          const at::Tensor& w_up_i8,
+                                          const at::Tensor& w_up_scale,
+                                          const at::Tensor& xn,
+                                          int64_t lora_rank, int64_t hc_count);
 std::tuple<at::Tensor, at::Tensor> rdna_gemv_act(
     const at::Tensor& x, const at::Tensor& w,
     const std::optional<at::Tensor>& scale, int64_t act_cols, double act_scale,
@@ -901,6 +910,44 @@ void moe_mxfp8_gemm_swiglu_rdna2(
     torch::Tensor num_tokens_post_padded, int64_t top_k, int64_t block_size_m,
     bool mul_topk_weight, int64_t output_topk, double gate_cap, double up_cap);
 
+void moe_nvfp4_gemm_hybrid_rdna2(
+    torch::Tensor a, torch::Tensor c, torch::Tensor dev_q_weight,
+    torch::Tensor dev_scales, torch::Tensor dev_globals,
+    torch::Tensor host_q_weight, torch::Tensor host_scales,
+    torch::Tensor host_globals, torch::Tensor resident_map,
+    torch::Tensor topk_weights, torch::Tensor sorted_token_ids,
+    torch::Tensor expert_ids, torch::Tensor num_tokens_post_padded,
+    int64_t top_k, int64_t block_size_m, bool mul_topk_weight,
+    int64_t output_topk);
+
+void moe_nvfp4_gemm_swiglu_hybrid_rdna2(
+    torch::Tensor gate_up, torch::Tensor c, torch::Tensor dev_q_weight,
+    torch::Tensor dev_scales, torch::Tensor dev_globals,
+    torch::Tensor host_q_weight, torch::Tensor host_scales,
+    torch::Tensor host_globals, torch::Tensor resident_map,
+    torch::Tensor topk_weights, torch::Tensor sorted_token_ids,
+    torch::Tensor expert_ids, torch::Tensor num_tokens_post_padded,
+    int64_t top_k, int64_t block_size_m, bool mul_topk_weight,
+    int64_t output_topk, double gate_cap, double up_cap);
+
+void moe_mxfp8_gemm_hybrid_rdna2(
+    torch::Tensor a, torch::Tensor c, torch::Tensor dev_q_weight,
+    torch::Tensor dev_scales, torch::Tensor host_q_weight,
+    torch::Tensor host_scales, torch::Tensor resident_map,
+    torch::Tensor topk_weights, torch::Tensor sorted_token_ids,
+    torch::Tensor expert_ids, torch::Tensor num_tokens_post_padded,
+    int64_t top_k, int64_t block_size_m, bool mul_topk_weight,
+    int64_t output_topk);
+
+void moe_mxfp8_gemm_swiglu_hybrid_rdna2(
+    torch::Tensor gate_up, torch::Tensor c, torch::Tensor dev_q_weight,
+    torch::Tensor dev_scales, torch::Tensor host_q_weight,
+    torch::Tensor host_scales, torch::Tensor resident_map,
+    torch::Tensor topk_weights, torch::Tensor sorted_token_ids,
+    torch::Tensor expert_ids, torch::Tensor num_tokens_post_padded,
+    int64_t top_k, int64_t block_size_m, bool mul_topk_weight,
+    int64_t output_topk, double gate_cap, double up_cap);
+
 // Inkling-2-Mini attention core on RDNA2 (gfx1030): paged short convolutions,
 // K/V prep and paged attention with learned relative bias and sink logit.
 // See docs/rdna2/inkling2-attn-kernels.md.
@@ -1386,6 +1433,14 @@ void inkling2_glue_msg_gate_mix(const torch::Tensor& h, const torch::Tensor& m,
                                 const std::optional<torch::Tensor>& counters,
                                 double norm_eps);
 
+void inkling2_glue_msg_gate_down_mix(
+    const torch::Tensor& h, const torch::Tensor& m, const torch::Tensor& wd,
+    const torch::Tensor& d, const torch::Tensor& wf, const torch::Tensor& wg,
+    const std::optional<torch::Tensor>& norm_w, const torch::Tensor& out,
+    const std::optional<torch::Tensor>& scratch,
+    const std::optional<torch::Tensor>& partials,
+    const std::optional<torch::Tensor>& counters, double eps, double norm_eps);
+
 void inkling2_glue_rms_norm(const torch::Tensor& x,
                             const std::optional<torch::Tensor>& x1,
                             const std::optional<torch::Tensor>& weight,
@@ -1522,6 +1577,12 @@ void moe_down_unquantized_rdna2(
     torch::Tensor slot_out,  // [M * topk, K] fp16, weighted down result per
                              // (token, top-k) pair; top-k reduced by moe_sum
     int64_t topk, int64_t N, int64_t K);
+
+void moe_gemm_unquantized_prefill_rdna2(
+    torch::Tensor x, torch::Tensor w, torch::Tensor sorted_token_ids,
+    torch::Tensor expert_ids, torch::Tensor num_tokens_post_padded,
+    torch::Tensor out, int64_t num_pairs, int64_t input_div_topk,
+    bool mul_topk_weight, torch::Tensor topk_weights);
 
 // ---------------------------------------------------------------------------
 // v1 worker input-batch kernels (gfx1030). HIP ports of

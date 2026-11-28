@@ -126,7 +126,9 @@ def test_loader_packs_every_tensor_where_the_kernels_read_it(model, draft):
         head.dflare_w[0].double(), _h(draft["markov_head.dflare_norm.weight"])
     )
     assert torch.equal(head.w1.double(), _h(draft["markov_head.markov_w1.weight"]))
-    assert torch.equal(head.rnn_proj_w.double(), _h(w))
+    # derive() frees the repacked checkpoint originals once rnn_wt/wh/wf and
+    # hidden_out_t are built.
+    assert head.rnn_proj_w.numel() == 0 and head.hidden_out_w.numel() == 0
     assert head.rnn_bias.dtype == torch.float32
     assert torch.equal(
         head.rnn_bias.double(), draft["markov_head.rnn_proj.bias"].bfloat16().double()
@@ -315,10 +317,263 @@ def test_draft_vocab_gathers_the_rows_of_the_listed_ids(model, tmp_path):
     got = model._derive_draft_vocab(_ids_file(tmp_path, ids))
     sel = torch.tensor(ids)
     assert torch.equal(got.ids, sel)
-    assert torch.equal(got.weight, lm[sel])
+    assert got.local_idx.dtype == torch.int32
+    assert torch.equal(got.local_idx, sel.to(torch.int32))
+    assert not hasattr(got, "weight")
     assert torch.equal(got.fold_w, m.fold_w[sel])
     assert torch.equal(got.fold_b, m.fold_b[sel])
-    assert got.weight.is_contiguous() and got.fold_w.is_contiguous()
+    assert got.fold_w.is_contiguous()
+
+
+@pytest.mark.parametrize("tp_size", [2, 4])
+def test_draft_vocab_shards_across_tp_ranks(draft, tmp_path, tp_size):
+    from vllm.models.inkling2_loop.amd.parallel import TensorParallel, lm_head_shard
+
+    # Vocab padded to multiple of 64 divisible by tp_size (320 = 64 * 5; 256 = 64 * 4).
+    vocab, padded = 250, 256
+    g = torch.Generator().manual_seed(7)
+    full_lm = torch.randn(vocab, TINY.hidden_size, generator=g).half()
+    full_fw = torch.randn(vocab, TINY.markov_rank, generator=g).half()
+    full_fb = torch.randn(vocab, generator=g)
+
+    # One list spanning all ranks, and one list concentrated on rank 0 (empty shards).
+    for ids in ([0, 17, 63, 64, 127, 128, 191, 192, 249], [0, 5, 12]):
+        path = _ids_file(tmp_path, ids)
+        collected_ids = []
+        for rank in range(tp_size):
+            lo, rows, take = lm_head_shard(vocab, tp_size, rank)
+            m = oracle.build_model(draft, vocab, padded, 4, 4096, "cpu", False)
+            m._tp = TensorParallel(tp_size, rank)
+            m._head_first, m._head_rows, m._head_take = lo, rows, take
+            lm_shard = torch.zeros(rows, TINY.hidden_size, dtype=torch.float16)
+            fw_shard = torch.zeros(rows, TINY.markov_rank, dtype=torch.float16)
+            fb_shard = torch.zeros(rows, dtype=torch.float32)
+            lm_shard[:take].copy_(full_lm[lo : lo + take])
+            fw_shard[:take].copy_(full_fw[lo : lo + take])
+            fb_shard[:take].copy_(full_fb[lo : lo + take])
+            m.lm_head = types.SimpleNamespace(weight=lm_shard)
+            m.model.markov_head.fold_w = fw_shard
+            m.model.markov_head.fold_b = fb_shard
+
+            got = m._derive_draft_vocab(path)
+            expected = [i for i in ids if lo <= i < lo + take]
+            sel = torch.tensor(expected, dtype=torch.int64)
+            assert torch.equal(got.ids, sel)
+            assert got.local_idx.dtype == torch.int32
+            assert torch.equal(got.local_idx, (sel - lo).to(torch.int32))
+            assert not hasattr(got, "weight")
+            if expected:
+                assert torch.equal(
+                    lm_shard.index_select(0, got.local_idx.long()), full_lm[sel]
+                )
+                assert torch.equal(got.fold_w, full_fw[sel])
+                assert torch.equal(got.fold_b, full_fb[sel])
+            else:
+                assert got.fold_w.shape == (0, TINY.markov_rank)
+                assert got.fold_b.shape == (0,)
+            collected_ids.extend(expected)
+        assert collected_ids == ids
+
+
+def test_greedy_draft_vocab_keeps_only_subset_folded_head_and_sizes_scratch(
+    draft, tmp_path, monkeypatch
+):
+    from vllm.models.inkling2_loop.amd import dspark as mod
+    from vllm.models.inkling2_loop.amd import parallel
+    from vllm.models.inkling2_loop.amd import state as state_mod
+
+    ids = [0, 3, 5, 11, 19, 42, 77, 100, 199, 250, 299]  # 11 ids -> pad 16
+    path = _ids_file(tmp_path, ids)
+    hf = oracle.draft_hf_config(draft, VOCAB, PADDED)
+
+    # Greedy + draft_vocab: scratch is sized to active_vocab, full fold_w/b freed,
+    # and attach_target frees hidden_out_t / hidden_out_b.
+    cfg_greedy = oracle.fake_vllm_config(hf, TINY.num_steps, 4, 4096)
+    cfg_greedy.speculative_config.speculator_options = {"draft_vocab": path}
+    monkeypatch.setattr(state_mod, "get_current_vllm_config", lambda: cfg_greedy)
+    monkeypatch.setattr(mod, "current_tensor_parallel", lambda: parallel.NO_TP)
+    with torch.device("cpu"):
+        m_greedy = mod.Inkling2DSparkModel(vllm_config=cfg_greedy)
+    m_greedy.load_weights((k, v.bfloat16()) for k, v in draft.tensors.items())
+    assert m_greedy._scratch.base.shape[1] == 16
+    assert m_greedy._scratch.logits.shape[1] == 16
+
+    g = torch.Generator().manual_seed(9)
+    lm = torch.randn(VOCAB, TINY.hidden_size, generator=g).half()
+    target = types.SimpleNamespace(
+        model=types.SimpleNamespace(
+            embed_norm=types.SimpleNamespace(weight=torch.ones(TINY.hidden_size).half())
+        )
+    )
+    m_greedy.lm_head = types.SimpleNamespace(weight=lm)
+    m_greedy.model.embed_tokens = types.SimpleNamespace(weight=lm)
+    # Reference full fold before attach_target frees hidden_out_t/b
+    ref_fw = (lm.float() @ m_greedy.model.markov_head.hidden_out_t.float().t()).to(
+        torch.float16
+    )
+    ref_fb = lm.float() @ m_greedy.model.markov_head.hidden_out_b.float()
+    m_greedy.attach_target(target)
+    head_g = m_greedy.model.markov_head
+    assert head_g.fold_w.numel() == 0 and head_g.fold_b.numel() == 0
+    assert head_g.hidden_out_t.numel() == 0 and head_g.hidden_out_b.numel() == 0
+    assert m_greedy._draft_vocab is not None
+    sel = torch.tensor(ids, dtype=torch.int64)
+    assert torch.equal(m_greedy._draft_vocab.fold_w, ref_fw[sel])
+    assert torch.allclose(m_greedy._draft_vocab.fold_b, ref_fb[sel], atol=1e-5)
+
+    # Probabilistic sampling keeps full-vocab fold_w / fold_b and full-vocab scratch.
+    cfg_prob = oracle.fake_vllm_config(hf, TINY.num_steps, 4, 4096)
+    cfg_prob.speculative_config.draft_sample_method = "probabilistic"
+    cfg_prob.speculative_config.speculator_options = {"draft_vocab": path}
+    monkeypatch.setattr(state_mod, "get_current_vllm_config", lambda: cfg_prob)
+    with torch.device("cpu"):
+        m_prob = mod.Inkling2DSparkModel(vllm_config=cfg_prob)
+    m_prob.load_weights((k, v.bfloat16()) for k, v in draft.tensors.items())
+    assert m_prob._scratch.base.shape[1] == -(-VOCAB // 8) * 8
+    m_prob.lm_head = types.SimpleNamespace(weight=lm)
+    m_prob.model.embed_tokens = types.SimpleNamespace(weight=lm)
+    m_prob.attach_target(target)
+    assert m_prob.model.markov_head.fold_w.shape == (VOCAB, TINY.markov_rank)
+    assert m_prob.model.markov_head.fold_b.shape == (VOCAB,)
+
+
+def test_per_batch_size_markov_steps_tracks_dynamic_schedule(draft, monkeypatch):
+    from vllm.models.inkling2_loop.amd import dspark as mod
+    from vllm.models.inkling2_loop.amd import parallel
+    from vllm.models.inkling2_loop.amd import state as state_mod
+
+    hf = oracle.draft_hf_config(draft, VOCAB, PADDED)
+    cfg = oracle.fake_vllm_config(hf, TINY.num_steps, 16, 4096)
+    cfg.speculative_config.num_speculative_tokens_per_batch_size = [
+        [1, 1, 7],
+        [2, 2, 2],
+        [3, 16, 0],
+    ]
+    monkeypatch.setattr(state_mod, "get_current_vllm_config", lambda: cfg)
+    monkeypatch.setattr(mod, "current_tensor_parallel", lambda: parallel.NO_TP)
+    with torch.device("cpu"):
+        m = mod.Inkling2DSparkModel(vllm_config=cfg)
+    assert m.steps_for_reqs(1) == 7
+    assert m.steps_for_reqs(2) == 2
+    assert m.steps_for_reqs(3) == 1
+    assert m.steps_for_reqs(16) == 1
+
+
+@pytest.mark.parametrize(
+    ("max_seqs", "target_cap", "max_draft_reqs", "expected_tokens"),
+    [
+        (2, 4, 2, [8, 16]),
+        (4, 8, 2, [8, 16]),
+        (4, 8, 4, [8, 16, 24, 32]),
+        (16, 32, 2, [8, 16]),
+    ],
+)
+def test_dflash_cudagraph_manager_captures_all_draft_reqs_above_target_cap(
+    monkeypatch, max_seqs, target_cap, max_draft_reqs, expected_tokens
+):
+    from vllm.config.compilation import CUDAGraphMode
+    from vllm.v1.worker.gpu import cudagraph_utils as cg_mod
+    from vllm.v1.worker.gpu.spec_decode.dflash.cudagraph import DFlashCudaGraphManager
+
+    monkeypatch.setattr(
+        cg_mod,
+        "get_pp_group",
+        lambda: types.SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    monkeypatch.setattr(cg_mod.current_platform, "get_global_graph_pool", lambda: None)
+
+    cc = types.SimpleNamespace(
+        prefill_cudagraph_capture_token_sizes=[],
+        decode_cudagraph_capture_request_sizes=[1],
+        max_cudagraph_capture_size=target_cap,
+        max_decode_cudagraph_capture_tokens=target_cap,
+        cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+        use_breakable_cudagraph=False,
+    )
+    vllm_cfg = types.SimpleNamespace(
+        scheduler_config=types.SimpleNamespace(
+            max_num_seqs=max_seqs, max_num_batched_tokens=1024
+        ),
+        compilation_config=cc,
+        parallel_config=types.SimpleNamespace(
+            tensor_parallel_size=1, data_parallel_size=1
+        ),
+        cache_config=types.SimpleNamespace(use_kda_recoverssm=False),
+        kernel_config=types.SimpleNamespace(monokernel=False),
+        additional_config={},
+        uniform_decode_query_len=1,
+    )
+    mgr = DFlashCudaGraphManager(
+        vllm_cfg,
+        torch.device("cpu"),
+        CUDAGraphMode.FULL_DECODE_ONLY,
+        decode_query_lens={8: max_draft_reqs},
+    )
+    # Target compilation_config must not be mutated.
+    assert cc.max_cudagraph_capture_size == target_cap
+    full_descs = mgr._capture_descs.get(CUDAGraphMode.FULL, [])
+    assert sorted(d.num_tokens for d in full_descs) == expected_tokens
+    mgr._graphs_captured = True
+    for r in range(1, max_draft_reqs + 1):
+        desc = mgr.dispatch(
+            num_reqs=r,
+            num_tokens=r * 8,
+            uniform_token_count=8,
+            num_active_loras=0,
+        )
+        assert desc.cg_mode == CUDAGraphMode.FULL
+        assert desc.num_tokens >= r * 8
+
+
+@pytest.mark.parametrize(
+    ("schedule", "max_seqs", "expected_max_reqs", "expected_mode"),
+    [
+        (None, 16, 16, "FULL_DECODE_ONLY"),
+        ([[1, 2, 2], [3, 16, 0]], 16, 2, "FULL_DECODE_ONLY"),
+        ([[1, 2, 7], [3, 16, 0]], 16, 2, "FULL_DECODE_ONLY"),
+        ([[1, 4, 2], [5, 16, 0]], 16, 4, "FULL_DECODE_ONLY"),
+        ([[1, 16, 0]], 16, 0, "NONE"),
+    ],
+)
+def test_dflash_cudagraph_manager_caps_capture_to_dynamic_schedule(
+    monkeypatch, schedule, max_seqs, expected_max_reqs, expected_mode
+):
+    from vllm.config.compilation import CUDAGraphMode
+    from vllm.v1.attention.backend import AttentionCGSupport
+    from vllm.v1.worker.gpu.spec_decode.dflash import speculator as dflash_mod
+
+    captured: dict = {}
+
+    class _DummyMgr:
+        def __init__(self, vllm_config, device, cudagraph_mode, decode_query_lens):
+            captured["mode"] = cudagraph_mode
+            captured["decode_query_lens"] = decode_query_lens
+
+    monkeypatch.setattr(dflash_mod, "DFlashCudaGraphManager", _DummyMgr)
+
+    spec_cfg = types.SimpleNamespace(
+        num_speculative_tokens_per_batch_size=schedule,
+        uses_dynamic_speculative_decoding=lambda: schedule is not None,
+    )
+    stub = types.SimpleNamespace(
+        _speculator_name="DFlash",
+        vllm_config=types.SimpleNamespace(speculative_config=spec_cfg),
+        device=torch.device("cpu"),
+        max_num_reqs=max_seqs,
+        num_speculative_steps=7,
+        num_query_per_req=8,
+        attn_cg_support=types.SimpleNamespace(
+            min_cg_support=AttentionCGSupport.UNIFORM_BATCH,
+            min_cg_attn_backend="TEST",
+        ),
+    )
+    stub._max_draft_reqs = lambda: dflash_mod.DFlashSpeculator._max_draft_reqs(stub)
+    assert stub._max_draft_reqs() == expected_max_reqs
+    dflash_mod.DFlashSpeculator.init_cudagraph_manager(
+        stub, CUDAGraphMode.FULL_AND_PIECEWISE
+    )
+    assert captured["mode"] == getattr(CUDAGraphMode, expected_mode)
+    assert captured["decode_query_lens"] == {8: max(expected_max_reqs, 1)}
 
 
 @pytest.mark.parametrize(
@@ -383,6 +638,48 @@ def test_adaptive_verification_is_refused_with_a_pointer_to_adaptive_k():
         spec.speculator_options = bad
         with pytest.raises(ValueError):
             Inkling2DSparkSpeculatorConfig.validate_options(spec)
+
+
+def test_adaptive_step_cost_selects_tp_table_and_scales_vocab(tmp_path):
+    """Adaptive K picks the measured TP=1/2/4 V620 step-cost model and scales
+    draft_vocab head savings inversely with TP."""
+    import numpy as np
+
+    from vllm.models.inkling2_loop.speculator_config import (
+        _V620_STEP_COST,
+        _V620_TP2_STEP_COST,
+        _V620_TP4_STEP_COST,
+        Inkling2DSparkSpeculatorConfig,
+    )
+
+    ids_path = tmp_path / "vocab.npy"
+    np.save(ids_path, np.arange(32768, dtype=np.int32))
+    spec = types.SimpleNamespace(
+        speculator_options={"adaptive_k": {}},
+        enable_adaptive_verification=False,
+        draft_model_config=types.SimpleNamespace(
+            hf_config=types.SimpleNamespace(vocab_size=200058)
+        ),
+    )
+    cfg = Inkling2DSparkSpeculatorConfig(spec)
+    p1 = cfg.make_num_tokens_policy([0, 7], tensor_parallel_size=1)
+    p2 = cfg.make_num_tokens_policy([0, 7], tensor_parallel_size=2)
+    p4 = cfg.make_num_tokens_policy([0, 7], tensor_parallel_size=4)
+    assert p1 is not None and p1.cost == _V620_STEP_COST
+    assert p2 is not None and p2.cost == _V620_TP2_STEP_COST
+    assert p4 is not None and p4.cost == _V620_TP4_STEP_COST
+
+    # With draft_vocab, savings halve at TP=2 and quarter at TP=4.
+    spec.speculator_options = {"adaptive_k": {}, "draft_vocab": str(ids_path)}
+    v1 = cfg.make_num_tokens_policy([0, 7], tensor_parallel_size=1)
+    v2 = cfg.make_num_tokens_policy([0, 7], tensor_parallel_size=2)
+    v4 = cfg.make_num_tokens_policy([0, 7], tensor_parallel_size=4)
+    assert v1 is not None and v2 is not None and v4 is not None
+    drop1 = _V620_STEP_COST.draft_ms - v1.cost.draft_ms
+    drop2 = _V620_TP2_STEP_COST.draft_ms - v2.cost.draft_ms
+    drop4 = _V620_TP4_STEP_COST.draft_ms - v4.cost.draft_ms
+    assert pytest.approx(drop2, rel=1e-6) == drop1 / 2.0
+    assert pytest.approx(drop4, rel=1e-6) == drop1 / 4.0
 
 
 # ---------------------------------------------------------------------------
@@ -560,6 +857,95 @@ def test_draft_vocab_restricts_the_greedy_chain(synthetic_hip, tmp_path):
     first = full.logits[:, 0, :][:, allowed].argmax(-1)
     assert torch.equal(ranked.tokens[:, 0], allowed[first])
     assert torch.equal(hip.propose(ctx, capture_logits=False).tokens, full.tokens)
+
+
+@requires_gpu
+@pytest.mark.parametrize("tp_size", [2, 4])
+def test_draft_vocab_tp_argmax_matches_single_rank(synthetic_hip, tmp_path, tp_size):
+    """TP=2 / TP=4 with draft_vocab (including an empty-shard case) reproduces the
+    TP=1 draft_vocab argmax bit for bit, including lowest-id tie breaking."""
+    import numpy as np
+
+    from vllm.models.inkling2_loop.amd.parallel import TensorParallel, lm_head_shard
+
+    hip, _ = synthetic_hip
+    model = hip.model
+    g = torch.Generator().manual_seed(29)
+    # 5 rows, including an exact cross-rank tie on row 4.
+    full_logits = torch.randn(5, SYN_VOCAB, generator=g, dtype=torch.float16).cuda()
+
+    # Case 1: ids spread across all ranks; Case 2: ids only on rank 0 (empty shards).
+    spread_ids = np.sort(
+        np.random.default_rng(7).choice(SYN_VOCAB, 700, replace=False)
+    ).astype(np.int32)
+    rank0_ids = np.arange(0, 128, 3, dtype=np.int32)
+    # Force an exact tie between the lowest and highest id in spread_ids on row 4.
+    full_logits[4, int(spread_ids[0])] = 25.0
+    full_logits[4, int(spread_ids[-1])] = 25.0
+
+    for listed in (spread_ids, rank0_ids):
+        allowed = torch.from_numpy(listed).long().cuda()
+        ref = allowed[full_logits[:, allowed].argmax(dim=-1)]
+
+        # Collect each rank's partial (value, global_id) as _argmax_across_ranks does.
+        partials: list[torch.Tensor] = []
+        for rank in range(tp_size):
+            lo, rows, take = lm_head_shard(SYN_VOCAB, tp_size, rank)
+            mask = (allowed >= lo) & (allowed < lo + take)
+            rank_ids = allowed[mask]
+            ranked = hip.mod._DraftVocab(
+                rank_ids,
+                (rank_ids - lo).to(torch.int32),
+                torch.empty((rank_ids.numel(), 0), dtype=torch.float16, device="cuda"),
+                torch.empty((rank_ids.numel(),), dtype=torch.float32, device="cuda"),
+            )
+            if rank_ids.numel() > 0:
+                model._scratch.logits[:5, : rank_ids.numel()].copy_(
+                    full_logits[:, rank_ids]
+                )
+            # Run the per-rank half of _argmax_across_ranks via a stub all_gather.
+            part = torch.empty(10, dtype=torch.float32, device="cuda")
+            if rank_ids.numel() == 0:
+                part[:5].fill_(float("-inf"))
+                part[5:10].view(torch.int32).fill_(0x7FFFFFFF)
+            else:
+                torch.ops._rocm_C.inkling2_dspark_argmax_partial(
+                    model._scratch.logits, part, 5, rank_ids.numel(), 0, ranked.ids
+                )
+            partials.append(part.view(10, 1))
+
+        gathered = torch.cat(partials, dim=-1).contiguous()
+        # Verify the actual _argmax_across_ranks helper end-to-end on rank 0.
+        orig_tp = model._tp
+        try:
+
+            class _FakeTP(TensorParallel):
+                def __init__(self, size, rank, expect0, out):
+                    super().__init__(size, rank)
+                    self._expect0 = expect0
+                    self._out = out
+
+                def all_gather(self, x, dim=-1):
+                    assert torch.equal(x, self._expect0)
+                    return self._out
+
+            model._tp = _FakeTP(tp_size, 0, partials[0], gathered)
+            lo0, _, take0 = lm_head_shard(SYN_VOCAB, tp_size, 0)
+            r0_ids = allowed[(allowed >= lo0) & (allowed < lo0 + take0)]
+            if r0_ids.numel() > 0:
+                model._scratch.logits[:5, : r0_ids.numel()].copy_(
+                    full_logits[:, r0_ids]
+                )
+            ranked0 = hip.mod._DraftVocab(
+                r0_ids,
+                (r0_ids - lo0).to(torch.int32),
+                torch.empty((r0_ids.numel(), 0), dtype=torch.float16, device="cuda"),
+                torch.empty((r0_ids.numel(),), dtype=torch.float32, device="cuda"),
+            )
+            got = model._argmax_across_ranks(5, ranked0)
+        finally:
+            model._tp = orig_tp
+        assert torch.equal(got, ref)
 
 
 @requires_gpu

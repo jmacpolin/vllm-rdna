@@ -17,7 +17,10 @@
 #                       (verdicts come from the recipe's production mode).
 # MODE=ab               base, head (default); MODE=abba: base, head, head, base on
 #                       fresh boots, which is what a speed claim needs.
-# EXACT=1               token-exact gate (default); 0 skips it.
+# EXACT=1               token-exact gate (default); keep enabled even for
+#                       numerics-change or known-lossy features (with FAIL_FAST=0
+#                       QUALITY=1) to measure token divergence; 0 is only for
+#                       re-running speed cells after exactness is already recorded.
 # QUALITY=1             adds the quality gate (default 0).
 # STALL=1               stall probe on every speed boot (default; 0 skips it): the
 #                       hard gate (no starved decoder) and the relative metrics.
@@ -25,10 +28,19 @@
 #                       STALL_LENS=4096,16384 prefill lengths; STALL_DECODERS:
 #                       decoders (default: the recipe's --max-num-seqs less one, so
 #                       that the injected prefill has a slot).
+# PREFIX_WORDS          prompt size (words) of the prefix-cache probe on every boot;
+#                       default: the recipe's PREFIX_PROBE_WORDS when it has one,
+#                       else 2600.
 # CELLS                 speed cells "in:out:conc[:prompts] ..." (default: the
 #                       contract's matrix, `pr_receipt_report.py cells`); none skips.
 # EXACT_CELLS           cells whose greedy texts are hashed on the deterministic
 #                       boots (default `pr_receipt_report.py cells --exact`).
+# LONG_CTX=auto         add 64k/128k speed+exact cells and passkey needle prompts
+#                       (`auto` enables when head `--max-model-len >= 131072` and
+#                       filters cells above max-model-len; `1` forces, `0` disables).
+# NEEDLE_LENS           comma-separated passkey needle token lengths for `quality_ab.py
+#                       collect --needle-lens` (default: 32768,65536,131072 <= max-len
+#                       when long-context is active, else empty).
 # QUALITY_WINDOWS       topk_kl.py windows file; default: QUALITY_LIMIT windows cut
 #                       from the tools tree's docs/ with the model's tokenizer.
 # QUALITY_LIMIT=64      windows per domain; QUALITY_TOP=20, QUALITY_PASSAGES=6,
@@ -40,7 +52,9 @@
 #                       when that tree exists, else ./pr-receipt/...); PORT=18780;
 #                       OWNER names the quiet window file (default $USER).
 # DRY_RUN=1             check the inputs, print the launch plans and the boots, stop.
-# FAIL_FAST=1           stop after a failed or inconclusive token-exact gate.
+# FAIL_FAST=1           stop after a failed or inconclusive token-exact gate; 0
+#                       continues into quality/speed boots after recording token
+#                       divergence (use for numerics-change and known-lossy features).
 #
 # Boots (a fresh server each, one at a time):
 #   exact  base, head  VLLM_RDNA2_MOE_DETERMINISTIC=1: greedy hashes, concurrency probe
@@ -95,6 +109,9 @@ QUALITY=${QUALITY:-0}
 QUALITY_LIMIT=${QUALITY_LIMIT:-64}
 QUALITY_TOP=${QUALITY_TOP:-20}
 QUALITY_PASSAGES=${QUALITY_PASSAGES:-6}
+LONG_CTX=${LONG_CTX:-auto}
+[[ $LONG_CTX == auto || $LONG_CTX == 0 || $LONG_CTX == 1 ]] \
+    || die "LONG_CTX is auto, 0 or 1, not $LONG_CTX"
 MAX_PPL_REL=${MAX_PPL_REL:-0.02}
 FAIL_FAST=${FAIL_FAST:-1}
 STALL=${STALL:-1}
@@ -112,10 +129,15 @@ for _o in ${OVERRIDES[@]+"${OVERRIDES[@]}"}; do
 done
 
 rcpt() { "$PY" "$REPORT" "$@"; }
-CELLS=${CELLS:-$(rcpt cells)}
-CELLS=$(rcpt cells "$CELLS") || die "bad CELLS"
-EXACT_CELLS=${EXACT_CELLS:-$(rcpt cells --exact)}
-EXACT_CELLS=$(rcpt cells "$EXACT_CELLS") || die "bad EXACT_CELLS"
+_CELLS_SET=${CELLS+1}
+_EXACT_CELLS_SET=${EXACT_CELLS+1}
+_NEEDLE_LENS_SET=${NEEDLE_LENS+1}
+if [[ -n $_CELLS_SET ]]; then
+    CELLS=$(rcpt cells "$CELLS") || die "bad CELLS"
+fi
+if [[ -n $_EXACT_CELLS_SET ]]; then
+    EXACT_CELLS=$(rcpt cells "$EXACT_CELLS") || die "bad EXACT_CELLS"
+fi
 [[ $EXACT == 1 ]] || EXACT_CELLS=none
 
 tree_sha() {
@@ -174,8 +196,8 @@ _timeout=$(command -v timeout || command -v gtimeout || true)
 # The launch plan of each tree (serve_rdna.sh PRINT=1): the receipt shows whether they match.
 for _r in base head; do
     if [[ $_r == base ]]; then _tree=$BASE_TREE; _venv=$BASE_VENV; else _tree=$HEAD_TREE; _venv=$HEAD_VENV; fi
-    PRINT=1 bash "$_tree/tools/rdna/serve_rdna.sh" RECIPE="$RECIPE" MODEL="$MODEL" VENV="$_venv" \
-        VLLM_TREE="$_tree" HIP_VISIBLE_DEVICES="$GPUS" ROCR_VISIBLE_DEVICES= PORT="$PORT" \
+    PRINT=1 env -u ROCR_VISIBLE_DEVICES bash "$_tree/tools/rdna/serve_rdna.sh" RECIPE="$RECIPE" MODEL="$MODEL" VENV="$_venv" \
+        VLLM_TREE="$_tree" HIP_VISIBLE_DEVICES="$GPUS" PORT="$PORT" \
         HOST=127.0.0.1 VLLM_CACHE_ROOT="$OUT/cache/$_r/vllm" TRITON_CACHE_DIR="$OUT/cache/$_r/triton" \
         TORCHINDUCTOR_CACHE_DIR="$OUT/cache/$_r/inductor" VLLM_SERVER_DEV_MODE=1 \
         ${OVERRIDES[@]+"${OVERRIDES[@]}"} > "$OUT/plans/$_r.txt" 2>&1 \
@@ -187,6 +209,32 @@ PLAN_DIFF=$(rcpt plan-diff "$OUT/plans/base.txt" "$OUT/plans/head.txt" \
     --mask "$OUT/cache/base=<CACHE>" --mask "$OUT/cache/head=<CACHE>" \
     --out "$OUT/plans/diff.txt")
 COMPILATION=$(rcpt plan-field "$OUT/plans/head.txt" compilation)
+MAX_MODEL_LEN=$(rcpt plan-field "$OUT/plans/head.txt" max-model-len || true)
+use_long_ctx=0
+if [[ $LONG_CTX == 1 ]]; then
+    use_long_ctx=1
+elif [[ $LONG_CTX == auto && $MAX_MODEL_LEN =~ ^[0-9]+$ ]] && ((MAX_MODEL_LEN >= 131072)); then
+    use_long_ctx=1
+fi
+_cell_args=()
+((use_long_ctx == 1)) && _cell_args+=(--long-ctx)
+[[ $MAX_MODEL_LEN =~ ^[0-9]+$ ]] && _cell_args+=(--max-len "$MAX_MODEL_LEN")
+if [[ -z $_CELLS_SET ]]; then
+    CELLS=$(rcpt cells ${_cell_args[@]+"${_cell_args[@]}"}) || die "bad CELLS"
+fi
+if [[ $EXACT == 1 && -z $_EXACT_CELLS_SET ]]; then
+    EXACT_CELLS=$(rcpt cells --exact ${_cell_args[@]+"${_cell_args[@]}"}) || die "bad EXACT_CELLS"
+fi
+if [[ -z $_NEEDLE_LENS_SET ]]; then
+    NEEDLE_LENS=""
+    if ((use_long_ctx == 1)); then
+        for _nl in 32768 65536 131072; do
+            if [[ ! $MAX_MODEL_LEN =~ ^[0-9]+$ ]] || ((_nl <= MAX_MODEL_LEN)); then
+                NEEDLE_LENS+="${NEEDLE_LENS:+,}$_nl"
+            fi
+        done
+    fi
+fi
 if [[ $STALL == 1 && -z ${STALL_DECODERS:-} ]]; then
     _seqs=$(rcpt plan-field "$OUT/plans/head.txt" max-num-seqs)
     if [[ ! $_seqs =~ ^[0-9]+$ ]] || ((_seqs < 2)); then
@@ -244,14 +292,16 @@ REPRO=""
 for _w in "BASE_TREE=$BASE_TREE" "HEAD_TREE=$HEAD_TREE" "BASE_VENV=$BASE_VENV" "HEAD_VENV=$HEAD_VENV" \
     "RECIPE=$RECIPE" "MODEL=$MODEL" "GPUS=$GPUS" "MODE=$MODE" "EXACT=$EXACT" "QUALITY=$QUALITY" \
     "STALL=$STALL" "STALL_REPEATS=$STALL_REPEATS" "STALL_LENS=$STALL_LENS" "STALL_DECODERS=$STALL_DECODERS" \
-    "CELLS=$CELLS" "EXACT_CELLS=$EXACT_CELLS" bash tools/rdna/pr_receipt.sh \
+    "CELLS=$CELLS" "EXACT_CELLS=$EXACT_CELLS" "LONG_CTX=$LONG_CTX" "NEEDLE_LENS=$NEEDLE_LENS" \
+    bash tools/rdna/pr_receipt.sh \
     ${OVERRIDES[@]+"${OVERRIDES[@]}"}; do
     REPRO+=$(shq "$_w")
 done
 REPRO=${REPRO% }
 rcpt set "$OUT" "mode=$MODE" "recipe=$RECIPE" "model=$MODEL" "model_rev=$(model_rev)" \
     "model_cfg_sha=$cfg_sha" "gpus=$GPUS" "overrides=${OVERRIDES[*]-}" "cells=$CELLS" \
-    "exact_cells=$EXACT_CELLS" "exact=$EXACT" "quality=$QUALITY" "quality_limit=$QUALITY_LIMIT" \
+    "exact_cells=$EXACT_CELLS" "long_ctx=$LONG_CTX" "max_model_len=$MAX_MODEL_LEN" \
+    "needle_lens=$NEEDLE_LENS" "exact=$EXACT" "quality=$QUALITY" "quality_limit=$QUALITY_LIMIT" \
     "stall=$STALL" "stall_repeats=$STALL_REPEATS" "stall_lens=$STALL_LENS" "stall_decoders=$STALL_DECODERS" \
     "quality_windows=$QUALITY_WINDOWS" "max_ppl_rel=$MAX_PPL_REL" \
     "base_tree=$BASE_TREE" "base_sha=$BASE_SHA" "base_venv=$BASE_VENV" \
@@ -273,7 +323,7 @@ if [[ -n ${DRY_RUN:-} ]]; then
     echo "boots: ${PLAN[*]}"
     echo "speed cells: $CELLS"
     echo "exactness cells: $EXACT_CELLS"
-    echo "quality: $QUALITY (windows ${QUALITY_WINDOWS:-none}, limit $QUALITY_LIMIT)"
+    echo "quality: $QUALITY (windows ${QUALITY_WINDOWS:-none}, limit $QUALITY_LIMIT, needle ${NEEDLE_LENS:-none})"
     echo "stall probe: $STALL (decoders $STALL_DECODERS, prefill $STALL_LENS, repeats $STALL_REPEATS)"
     echo "diff scan: ${SCAN_NOTE:-did not run}"
     exit 0
@@ -366,7 +416,7 @@ fi
 
 run_boot() { # id role kind
     local id=$1 role=$2 kind=$3 tree venv bdir cells bench_extra hold=0 hook="" conc=1 rc t0 py
-    local -a det=() stall=()
+    local -a det=() stall=() prefix=()
     if [[ $role == base ]]; then tree=$BASE_TREE; venv=$BASE_VENV; else tree=$HEAD_TREE; venv=$HEAD_VENV; fi
     py=$(command -v "$(pyof "$venv")")
     bdir=$OUT/boots/$id
@@ -393,6 +443,12 @@ run_boot() { # id role kind
             conc=0
             ;;
     esac
+    # The prefix probe's prompt size: PREFIX_WORDS from the caller, else the recipe's
+    # PREFIX_PROBE_WORDS (serve_validate.sh reads it from the same tree), else 2600.
+    if [[ -n ${PREFIX_WORDS:-} ]] \
+        || ! grep -q '^PREFIX_PROBE_WORDS=[0-9]' "$tree/tools/rdna/recipes/$RECIPE.env" 2> /dev/null; then
+        prefix=(PREFIX_WORDS="${PREFIX_WORDS:-2600}")
+    fi
     wait_idle
     note "boot $id ($role, $kind): $tree"
     t0=$(date -u +%T)
@@ -408,10 +464,11 @@ run_boot() { # id role kind
         OUT="$bdir" CACHE="$OUT/cache/$role/$id" VENV="$venv" SERVE_TREE="$tree" \
         TRITON_CACHE_DIR="$OUT/cache/$role/triton" TORCHINDUCTOR_CACHE_DIR="$OUT/cache/$role/inductor" \
         CELLS="$cells" BENCH_EXTRA="$bench_extra" RESET_PREFIX_CACHE=1 CONC_PROBE="$conc" \
-        PREFIX_WORDS="${PREFIX_WORDS:-2600}" ${stall[@]+"${stall[@]}"} \
+        ${prefix[@]+"${prefix[@]}"} ${stall[@]+"${stall[@]}"} \
         QUIET_HOLD="$hold" READY_TIMEOUT="${READY_TIMEOUT:-1800}" STOP_GRACE="${STOP_GRACE:-120}" \
         LOAD_HOOK="$hook" RECEIPT_PY="$py" RECEIPT_TOOLS="$TOOLS" QUALITY_WINDOWS="$QUALITY_WINDOWS" \
         QUALITY_LIMIT="$QUALITY_LIMIT" QUALITY_TOP="$QUALITY_TOP" QUALITY_PASSAGES="$QUALITY_PASSAGES" \
+        NEEDLE_LENS="$NEEDLE_LENS" \
         ${LIMIT[@]+"${LIMIT[@]}"} \
         bash "$SERVE_VALIDATE" VLLM_SERVER_DEV_MODE=1 ${OVERRIDES[@]+"${OVERRIDES[@]}"} \
         ${det[@]+"${det[@]}"} > "$bdir/driver.log" 2>&1 &

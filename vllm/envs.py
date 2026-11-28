@@ -201,6 +201,12 @@ if TYPE_CHECKING:
     VLLM_RDNA_AR: str = "0"
     VLLM_RDNA_AR_HIER: str = "auto"
     VLLM_KV_CACHE_MARGIN_FLOOR_MIB: int | None = None
+    VLLM_INKLING2_MOE_OFFLOAD_SLOTS: int = 0
+    VLLM_INKLING2_MOE_OFFLOAD_COPY: str = "tensor"
+    VLLM_INKLING2_MOE_OFFLOAD_POLICY: str = "lfu_lru"
+    VLLM_INKLING2_MOE_OFFLOAD_DECAY: int = 128
+    VLLM_INKLING2_MOE_OFFLOAD_HYBRID: bool = False
+    VLLM_INKLING2_MOE_OFFLOAD_PINGPONG: bool = False
     VLLM_ROCM_PARALLEL_INDEX_TOPK: bool = False
     VLLM_ENABLE_V1_MULTIPROCESSING: bool = True
     VLLM_LOG_BATCHSIZE_INTERVAL: float = -1
@@ -1679,6 +1685,35 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # difference, so lower it only after watching the peak device use of the workload.
     "VLLM_KV_CACHE_MARGIN_FLOOR_MIB": lambda: maybe_convert_int(
         os.environ.get("VLLM_KV_CACHE_MARGIN_FLOOR_MIB") or None
+    ),
+    # Inkling-2-Mini TP=1 MoE expert offloading (PackedExpertCache).
+    # 0 disables offloading completely; 1..128 selects resident GPU slots/layer.
+    "VLLM_INKLING2_MOE_OFFLOAD_SLOTS": lambda: int(
+        os.getenv("VLLM_INKLING2_MOE_OFFLOAD_SLOTS", "0") or "0"
+    ),
+    "VLLM_INKLING2_MOE_OFFLOAD_COPY": lambda: (
+        os.getenv("VLLM_INKLING2_MOE_OFFLOAD_COPY", "tensor") or "tensor"
+    ),
+    "VLLM_INKLING2_MOE_OFFLOAD_POLICY": lambda: (
+        os.getenv("VLLM_INKLING2_MOE_OFFLOAD_POLICY", "lfu_lru") or "lfu_lru"
+    ),
+    "VLLM_INKLING2_MOE_OFFLOAD_DECAY": lambda: int(
+        os.getenv("VLLM_INKLING2_MOE_OFFLOAD_DECAY", "128") or "128"
+    ),
+    "VLLM_INKLING2_MOE_OFFLOAD_PREFETCH": lambda: (
+        os.getenv("VLLM_INKLING2_MOE_OFFLOAD_PREFETCH", "1").strip() not in ("", "0")
+    ),
+    "VLLM_INKLING2_MOE_OFFLOAD_PREFETCH_TOPK": lambda: int(
+        os.getenv("VLLM_INKLING2_MOE_OFFLOAD_PREFETCH_TOPK", "4") or "4"
+    ),
+    "VLLM_INKLING2_MOE_OFFLOAD_PREFETCH_MAX": lambda: int(
+        os.getenv("VLLM_INKLING2_MOE_OFFLOAD_PREFETCH_MAX", "4") or "4"
+    ),
+    "VLLM_INKLING2_MOE_OFFLOAD_HYBRID": lambda: (
+        os.getenv("VLLM_INKLING2_MOE_OFFLOAD_HYBRID", "0") == "1"
+    ),
+    "VLLM_INKLING2_MOE_OFFLOAD_PINGPONG": lambda: (
+        os.getenv("VLLM_INKLING2_MOE_OFFLOAD_PINGPONG", "0") == "1"
     ),
     # Enable parallel decode top-16 selection for the MiniMax-M3.1 NVFP4
     # indexer on ROCm gfx950 (MI355X). Set to 1 to enable; disabled by default.

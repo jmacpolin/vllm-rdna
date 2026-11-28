@@ -117,9 +117,14 @@ class DFlashSpeculator(DraftModelSpeculator):
         self._num_rejected: torch.Tensor | None = None
         aux_layers = get_eagle3_aux_layers_from_config(speculative_config)
         cudagraph_mode = vllm_config.compilation_config.cudagraph_mode
-        if aux_layers and cudagraph_mode.decode_mode() == CUDAGraphMode.FULL:
+        max_graph_reqs = self._max_draft_reqs()
+        if (
+            aux_layers
+            and cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
+            and max_graph_reqs > 0
+        ):
             self._aux_staging = torch.zeros(
-                self._num_graph_context_tokens(self.max_num_reqs),
+                self._num_graph_context_tokens(max_graph_reqs),
                 len(aux_layers) * vllm_config.model_config.get_hidden_size(),
                 dtype=self.dtype,
                 device=device,
@@ -150,7 +155,8 @@ class DFlashSpeculator(DraftModelSpeculator):
 
     @property
     def attn_vllm_config(self) -> VllmConfig:
-        # The draft's attention differs from the target's in causality.
+        # The draft's attention differs from the target's in causality and can
+        # capture wider uniform blocks (r * num_query_per_req) than target decode.
         config = super().attn_vllm_config
         if self.draft_model_config.dtype != config.model_config.dtype:
             config.model_config = self.draft_model_config
@@ -158,7 +164,43 @@ class DFlashSpeculator(DraftModelSpeculator):
             config.attention_config,
             use_non_causal=self.requires_non_causal,
         )
+        max_draft_tokens = min(
+            self._max_draft_reqs() * self.num_query_per_req, self.max_num_tokens
+        )
+        cc = config.compilation_config
+        if max_draft_tokens > 0 and cc is not None:
+            cur_max = cc.max_cudagraph_capture_size or 0
+            cur_dec = cc.max_decode_cudagraph_capture_tokens
+            if cur_max < max_draft_tokens or (
+                cur_dec is not None and cur_dec < max_draft_tokens
+            ):
+                cc = copy.copy(cc)
+                cc.max_cudagraph_capture_size = max(cur_max, max_draft_tokens)
+                if cur_dec is not None:
+                    cc.max_decode_cudagraph_capture_tokens = max(
+                        cur_dec, max_draft_tokens
+                    )
+                config.compilation_config = cc
         return config
+
+    def _max_draft_reqs(self) -> int:
+        """Largest batch size for which the dynamic schedule drafts tokens.
+
+        When ``num_speculative_tokens_per_batch_size`` drops drafting to 0
+        above some batch size, ``propose()`` skips the query pass there, so
+        larger draft CUDA graphs would never replay.
+        """
+        spec = self.vllm_config.speculative_config
+        if spec is None or not spec.uses_dynamic_speculative_decoding():
+            return self.max_num_reqs
+        from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
+
+        dense = build_dynamic_sd_schedule_lookup(
+            spec.num_speculative_tokens_per_batch_size,
+            vllm_max_batch_size=self.max_num_reqs,
+            vllm_num_speculative_tokens=self.num_speculative_steps,
+        )
+        return max((b for b, k in enumerate(dense) if b > 0 and k > 0), default=0)
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         wants_full = cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
@@ -173,8 +215,9 @@ class DFlashSpeculator(DraftModelSpeculator):
                 self._speculator_name,
                 self.attn_cg_support.min_cg_attn_backend,
             )
+        max_graph_reqs = self._max_draft_reqs()
         # PIECEWISE cudagraphs are not supported for dflash.
-        if wants_full and supports_full:
+        if wants_full and supports_full and max_graph_reqs > 0:
             cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
         else:
             cudagraph_mode = CUDAGraphMode.NONE
@@ -183,7 +226,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             self.vllm_config,
             self.device,
             cudagraph_mode,
-            decode_query_lens={self.num_query_per_req: self.max_num_reqs},
+            decode_query_lens={self.num_query_per_req: max(max_graph_reqs, 1)},
         )
 
     def capture(self) -> None:
@@ -206,6 +249,14 @@ class DFlashSpeculator(DraftModelSpeculator):
             prepare_forward=self._prepare_graph_forward,
             progress_bar_desc=f"Capturing {self._speculator_name.lower()} CUDA graphs",
         )
+
+    def _replay_fullgraph(
+        self,
+        batch_desc: Any,
+        num_speculative_tokens: int | None = None,
+    ) -> None:
+        assert self.query_cudagraph_manager is not None
+        self.query_cudagraph_manager.run_fullgraph(batch_desc)
 
     def _prepare_graph_forward(
         self, num_reqs: int, attn_metadata: dict[str, Any] | None
@@ -681,7 +732,7 @@ class DFlashSpeculator(DraftModelSpeculator):
 
         if is_full_cudagraph:
             assert self.query_cudagraph_manager is not None
-            self.query_cudagraph_manager.run_fullgraph(batch_desc)
+            self._replay_fullgraph(batch_desc, num_speculative_tokens)
         else:
             draft_slot_mappings_by_layer = build_slot_mappings_by_layer(
                 self.block_tables.slot_mappings[:, :num_tokens_padded],

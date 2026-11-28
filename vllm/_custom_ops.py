@@ -1757,6 +1757,35 @@ if hasattr(torch.ops, "_rocm_C") and hasattr(
         return
 
 
+if hasattr(torch.ops, "_rocm_C") and hasattr(torch.ops._rocm_C, "gemm_w8a8_i8_rdna2"):
+
+    @register_fake("_rocm_C::gemm_w8a8_i8_rdna2")
+    def _gemm_w8a8_i8_rdna2_fake(
+        x: torch.Tensor,
+        w_i8: torch.Tensor,
+        w_scale: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        design: int = -1,
+    ) -> torch.Tensor:
+        return x.new_empty((x.shape[0], w_i8.shape[0]))
+
+
+if hasattr(torch.ops, "_rocm_C") and hasattr(
+    torch.ops._rocm_C, "rdna_hc_up_gate_mix_prefill_i8"
+):
+
+    @register_fake("_rocm_C::rdna_hc_up_gate_mix_prefill_i8")
+    def _rdna_hc_up_gate_mix_prefill_i8_fake(
+        dai: torch.Tensor,
+        w_up_i8: torch.Tensor,
+        w_up_scale: torch.Tensor,
+        xn: torch.Tensor,
+        lora_rank: int,
+        hc_count: int,
+    ) -> torch.Tensor:
+        return xn.new_empty((dai.shape[0], xn.shape[1] // hc_count))
+
+
 if hasattr(torch.ops, "_rocm_C") and hasattr(
     torch.ops._rocm_C, "rdna_hint_flex_gemv2_rdna2"
 ):
@@ -2038,6 +2067,166 @@ def moe_mxfp8_gemm_swiglu_rdna2(
         c,
         b_q_weight,
         b_scales,
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        top_k,
+        block_size_m,
+        mul_topk_weight,
+        output_topk,
+        gate_cap,
+        up_cap,
+    )
+
+
+def moe_nvfp4_gemm_hybrid_rdna2(
+    a: torch.Tensor,
+    c: torch.Tensor,
+    dev_q_weight: torch.Tensor,
+    dev_scales: torch.Tensor,
+    dev_globals: torch.Tensor,
+    host_q_weight: torch.Tensor,
+    host_scales: torch.Tensor,
+    host_globals: torch.Tensor,
+    resident_map: torch.Tensor,
+    topk_weights: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    top_k: int,
+    block_size_m: int,
+    mul_topk_weight: bool,
+    output_topk: int,
+) -> None:
+    torch.ops._rocm_C.moe_nvfp4_gemm_hybrid_rdna2(
+        a,
+        c,
+        dev_q_weight,
+        dev_scales,
+        dev_globals,
+        host_q_weight,
+        host_scales,
+        host_globals,
+        resident_map,
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        top_k,
+        block_size_m,
+        mul_topk_weight,
+        output_topk,
+    )
+
+
+def moe_nvfp4_gemm_swiglu_hybrid_rdna2(
+    gate_up: torch.Tensor,
+    c: torch.Tensor,
+    dev_q_weight: torch.Tensor,
+    dev_scales: torch.Tensor,
+    dev_globals: torch.Tensor,
+    host_q_weight: torch.Tensor,
+    host_scales: torch.Tensor,
+    host_globals: torch.Tensor,
+    resident_map: torch.Tensor,
+    topk_weights: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    top_k: int,
+    block_size_m: int,
+    mul_topk_weight: bool,
+    output_topk: int,
+    gate_cap: float,
+    up_cap: float,
+) -> None:
+    torch.ops._rocm_C.moe_nvfp4_gemm_swiglu_hybrid_rdna2(
+        gate_up,
+        c,
+        dev_q_weight,
+        dev_scales,
+        dev_globals,
+        host_q_weight,
+        host_scales,
+        host_globals,
+        resident_map,
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        top_k,
+        block_size_m,
+        mul_topk_weight,
+        output_topk,
+        gate_cap,
+        up_cap,
+    )
+
+
+def moe_mxfp8_gemm_hybrid_rdna2(
+    a: torch.Tensor,
+    c: torch.Tensor,
+    dev_q_weight: torch.Tensor,
+    dev_scales: torch.Tensor,
+    host_q_weight: torch.Tensor,
+    host_scales: torch.Tensor,
+    resident_map: torch.Tensor,
+    topk_weights: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    top_k: int,
+    block_size_m: int,
+    mul_topk_weight: bool,
+    output_topk: int,
+) -> None:
+    torch.ops._rocm_C.moe_mxfp8_gemm_hybrid_rdna2(
+        a,
+        c,
+        dev_q_weight,
+        dev_scales,
+        host_q_weight,
+        host_scales,
+        resident_map,
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        top_k,
+        block_size_m,
+        mul_topk_weight,
+        output_topk,
+    )
+
+
+def moe_mxfp8_gemm_swiglu_hybrid_rdna2(
+    gate_up: torch.Tensor,
+    c: torch.Tensor,
+    dev_q_weight: torch.Tensor,
+    dev_scales: torch.Tensor,
+    host_q_weight: torch.Tensor,
+    host_scales: torch.Tensor,
+    resident_map: torch.Tensor,
+    topk_weights: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    top_k: int,
+    block_size_m: int,
+    mul_topk_weight: bool,
+    output_topk: int,
+    gate_cap: float,
+    up_cap: float,
+) -> None:
+    torch.ops._rocm_C.moe_mxfp8_gemm_swiglu_hybrid_rdna2(
+        gate_up,
+        c,
+        dev_q_weight,
+        dev_scales,
+        host_q_weight,
+        host_scales,
+        resident_map,
         topk_weights,
         sorted_token_ids,
         expert_ids,
@@ -2430,23 +2619,39 @@ def inkling2_dspark_gemv(
     num_rows: int,
     splits: int = 0,
     variant: int = 0,
+    w_row_ids: torch.Tensor | None = None,
 ) -> None:
     """Skinny fp16 GEMM out = x @ w.T for num_rows <= 32 (fp32 accumulation).
 
     splits == 0 writes fp16 out [rows, N]; splits > 0 writes the fp32 partial
     sums over K / splits into out [splits, rows, N] (the consumer adds them).
-    x_index (int64) gathers the activation rows; variant forces rows per wave.
+    x_index (int64) gathers the activation rows; w_row_ids (int32/int64) gathers
+    the weight rows directly from w; variant forces rows per wave.
     """
-    torch.ops._rocm_C.inkling2_dspark_gemv(
-        x, w, out, x_index, num_rows, splits, variant
-    )
+    if w_row_ids is None:
+        torch.ops._rocm_C.inkling2_dspark_gemv(
+            x, w, out, x_index, num_rows, splits, variant
+        )
+    else:
+        torch.ops._rocm_C.inkling2_dspark_gemv(
+            x, w, out, x_index, num_rows, splits, variant, w_row_ids
+        )
 
 
 def inkling2_dspark_gemm(
-    x: torch.Tensor, w: torch.Tensor, out: torch.Tensor, num_rows: int, design: int
+    x: torch.Tensor,
+    w: torch.Tensor,
+    out: torch.Tensor,
+    num_rows: int,
+    design: int,
+    w_row_ids: torch.Tensor | None = None,
 ) -> None:
-    """Dense fp16 GEMM out = x @ w.T on rdna_hint_flex design 0..5 (no rocBLAS)."""
-    torch.ops._rocm_C.inkling2_dspark_gemm(x, w, out, num_rows, design)
+    """Dense fp16 GEMM out = x @ w.T on rdna_hint_flex design 0..5 (no rocBLAS),
+    with optional zero-copy weight row gather ``w_row_ids``."""
+    if w_row_ids is None:
+        torch.ops._rocm_C.inkling2_dspark_gemm(x, w, out, num_rows, design)
+    else:
+        torch.ops._rocm_C.inkling2_dspark_gemm(x, w, out, num_rows, design, w_row_ids)
 
 
 def inkling2_dspark_qkv_prep(
@@ -2562,22 +2767,42 @@ def inkling2_dspark_fold_bias(
 
 
 def inkling2_dspark_argmax(
-    logits: torch.Tensor, out: torch.Tensor, num_rows: int, vocab: int
+    logits: torch.Tensor,
+    out: torch.Tensor,
+    num_rows: int,
+    vocab: int,
+    token_map: torch.Tensor | None = None,
 ) -> None:
     """out[r] = argmax(logits[r, :vocab]) for fp16 rows (NaN as -inf, lowest index
-    on ties); out is an int64 vector, possibly a strided column of a token table."""
-    torch.ops._rocm_C.inkling2_dspark_argmax(logits, out, num_rows, vocab)
+    on ties), optionally remapped through ``token_map``; out is an int64 vector,
+    possibly a strided column of a token table."""
+    if token_map is None:
+        torch.ops._rocm_C.inkling2_dspark_argmax(logits, out, num_rows, vocab)
+    else:
+        torch.ops._rocm_C.inkling2_dspark_argmax(
+            logits, out, num_rows, vocab, token_map
+        )
 
 
 def inkling2_dspark_argmax_partial(
-    logits: torch.Tensor, part: torch.Tensor, num_rows: int, vocab: int, first_id: int
+    logits: torch.Tensor,
+    part: torch.Tensor,
+    num_rows: int,
+    vocab: int,
+    first_id: int,
+    token_map: torch.Tensor | None = None,
 ) -> None:
     """The (value, id) partial of one vocabulary shard: ``part[r]`` is the fp32 maximum
-    of ``logits[r, :vocab]`` and ``part[num_rows + r]`` the int32 bits of ``first_id``
-    plus the lowest index of that maximum (NaN as -inf)."""
-    torch.ops._rocm_C.inkling2_dspark_argmax_partial(
-        logits, part, num_rows, vocab, first_id
-    )
+    of ``logits[r, :vocab]`` and ``part[num_rows + r]`` the int32 bits of ``token_map``
+    (or ``first_id`` plus the lowest index) of that maximum (NaN as -inf)."""
+    if token_map is None:
+        torch.ops._rocm_C.inkling2_dspark_argmax_partial(
+            logits, part, num_rows, vocab, first_id
+        )
+    else:
+        torch.ops._rocm_C.inkling2_dspark_argmax_partial(
+            logits, part, num_rows, vocab, first_id, token_map
+        )
 
 
 def inkling2_dspark_prepare_inputs(
@@ -2838,6 +3063,7 @@ def inkling2_glue_attn_res(
     partial_out: torch.Tensor | None = None,
     append: torch.Tensor | None = None,
     norm_w: torch.Tensor | None = None,
+    norm_out2: torch.Tensor | None = None,
     eps: float = 1e-6,
     norm_eps: float = 1e-6,
 ) -> None:
@@ -2861,10 +3087,28 @@ def inkling2_glue_attn_res(
         append: optional ``[T, H]`` fp32 state inserted before the partial.
         norm_w: optional ``[1 or Q, H]`` fp16 / fp32 RMSNorm weight; the
             result is then normalised per query and written as fp16.
+        norm_out2: optional ``[T, H]`` fp32 or bf16 secondary norm output
+            (``Q == 1`` with ``norm_w``), written in the same launch.
         eps: epsilon of the unweighted state norm.
         norm_eps: epsilon of the weighted output norm.
 
     """
+    if norm_out2 is not None:
+        torch.ops._rocm_C.inkling2_glue_attn_res_dual(
+            blocks,
+            n_blocks,
+            x0,
+            x1,
+            partial_out,
+            append,
+            query,
+            norm_w,
+            out,
+            norm_out2,
+            eps,
+            norm_eps,
+        )
+        return
     torch.ops._rocm_C.inkling2_glue_attn_res(
         blocks,
         n_blocks,
@@ -2875,6 +3119,67 @@ def inkling2_glue_attn_res(
         query,
         norm_w,
         out,
+        eps,
+        norm_eps,
+    )
+
+
+def inkling2_glue_attn_res_sconv(
+    blocks: torch.Tensor,
+    n_blocks: int,
+    x0: torch.Tensor | None,
+    conv_x: torch.Tensor,
+    conv_w: torch.Tensor,
+    conv_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_idx: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    stream_offset: int,
+    num_kv_heads: int,
+    block_size: int,
+    write_state: bool,
+    query: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    sconv_out: torch.Tensor | None = None,
+    partial_out: torch.Tensor | None = None,
+    append: torch.Tensor | None = None,
+    norm_w: torch.Tensor | None = None,
+    norm_out2: torch.Tensor | None = None,
+    eps: float = 1e-6,
+    norm_eps: float = 1e-6,
+) -> None:
+    """Static depthwise short-conv fused into the ``inkling2_glue_attn_res`` prologue.
+
+    Computes the 4-tap depthwise conv of ``conv_x [T, H]`` fp16 in an isolated
+    register prologue (optionally writing ``conv_cache`` when ``write_state`` is
+    True, and optionally storing ``sconv_out [T, H]`` fp32), forms the partial
+    state ``x0 + conv`` (or ``conv`` alone when ``x0`` is None), and executes
+    ``attn_res`` (+ optional ``norm_out2`` fp32/bf16) in one launch.
+    """
+    torch.ops._rocm_C.inkling2_glue_attn_res_sconv(
+        blocks,
+        n_blocks,
+        x0,
+        conv_x,
+        conv_w,
+        conv_cache,
+        block_table,
+        seq_idx,
+        query_start_loc,
+        seq_lens,
+        stream_offset,
+        num_kv_heads,
+        block_size,
+        write_state,
+        sconv_out,
+        partial_out,
+        append,
+        query,
+        norm_w,
+        out,
+        norm_out2,
         eps,
         norm_eps,
     )
@@ -3018,6 +3323,30 @@ def inkling2_glue_msg_gate_mix(
     """
     torch.ops._rocm_C.inkling2_glue_msg_gate_mix(
         h, m, d, wf, wg, norm_w, out, scratch, partials, counters, norm_eps
+    )
+
+
+def inkling2_glue_msg_gate_down_mix(
+    h: torch.Tensor,
+    m: torch.Tensor,
+    wd: torch.Tensor,
+    d: torch.Tensor,
+    wf: torch.Tensor,
+    wg: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    norm_w: torch.Tensor | None = None,
+    scratch: torch.Tensor | None = None,
+    partials: torch.Tensor | None = None,
+    counters: torch.Tensor | None = None,
+    eps: float = 1e-6,
+    norm_eps: float = 1e-6,
+) -> None:
+    """Fused MessageGate (``msg_gate_down`` + ``msg_gate_mix``) in one launch
+    when the grid fits one CTA per CU (deadlock-free), falling back to separate
+    ``down`` + ``mix`` otherwise."""
+    torch.ops._rocm_C.inkling2_glue_msg_gate_down_mix(
+        h, m, wd, d, wf, wg, norm_w, out, scratch, partials, counters, eps, norm_eps
     )
 
 
@@ -3181,6 +3510,103 @@ def inkling2_glue_copy_states(src: torch.Tensor, dst: torch.Tensor) -> None:
 
     """
     torch.ops._rocm_C.inkling2_glue_copy_states(src, dst)
+
+
+def inkling2_glue_loopcd_blend(
+    x0: torch.Tensor,
+    prev_x0: torch.Tensor,
+    prev_x1: torch.Tensor,
+    omega: torch.Tensor,
+    *,
+    x1: torch.Tensor | None = None,
+    blk: torch.Tensor | None = None,
+    prev_blk: torch.Tensor | None = None,
+    omega_blk: torch.Tensor | None = None,
+) -> None:
+    """In-place LoopCD hidden-state and block-state extrapolation on RDNA2.
+
+    Tokens with ``omega[t] == 0`` are an exact 0-ULP no-op (neither ``x0`` nor
+    ``x1`` is read or written).
+    """
+    torch.ops._rocm_C.inkling2_glue_loopcd_blend(
+        x0, x1, prev_x0, prev_x1, blk, prev_blk, omega, omega_blk
+    )
+
+
+def inkling2_glue_loopcd_readout(
+    blocks: torch.Tensor,
+    n_blocks: int,
+    x0: torch.Tensor,
+    query: torch.Tensor,
+    norm_w: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    x1: torch.Tensor | None = None,
+    gate_flag: torch.Tensor | None = None,
+    eps: float = 1e-6,
+    norm_eps: float = 1e-6,
+) -> None:
+    """Skip-coda normalized ``Q=1`` ``attn_res`` readout for LoopCD-Logits."""
+    torch.ops._rocm_C.inkling2_glue_loopcd_readout(
+        blocks,
+        n_blocks,
+        x0,
+        x1,
+        query,
+        norm_w,
+        out,
+        gate_flag,
+        eps,
+        norm_eps,
+    )
+
+
+def inkling2_loopcd_prepare_hidden(
+    omega_out: torch.Tensor,
+    omega_blk_out: torch.Tensor,
+    idx_mapping: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    prefill_len: torch.Tensor,
+    req_alpha: torch.Tensor,
+    req_mode: torch.Tensor,
+    req_blend_blk: torch.Tensor,
+    num_tokens_padded: int,
+) -> None:
+    """Populate ``omega_out`` and ``omega_blk_out`` on GPU for LoopCD-Hidden."""
+    torch.ops._rocm_C.inkling2_loopcd_prepare_hidden(
+        omega_out,
+        omega_blk_out,
+        idx_mapping,
+        query_start_loc,
+        seq_lens,
+        prefill_len,
+        req_alpha,
+        req_mode,
+        req_blend_blk,
+        num_tokens_padded,
+    )
+
+
+def inkling2_loopcd_logits(
+    z_final: torch.Tensor,
+    z_first: torch.Tensor,
+    omega: torch.Tensor,
+    log_beta: torch.Tensor,
+    adaptive: torch.Tensor,
+    *,
+    stats_scratch: torch.Tensor | None = None,
+) -> None:
+    """Fused 2-pass contrastive logits update in place for LoopCD-Logits."""
+    if stats_scratch is None:
+        stats_scratch = torch.empty(
+            (z_final.shape[0], 32, 2),
+            dtype=torch.float32,
+            device=z_final.device,
+        )
+    torch.ops._rocm_C.inkling2_loopcd_logits(
+        z_final, z_first, omega, log_beta, adaptive, stats_scratch
+    )
 
 
 if hasattr(torch.ops, "_rocm_C") and hasattr(torch.ops._rocm_C, "moe_mxfp4_gemm_rdna2"):
@@ -4838,6 +5264,31 @@ def gemv_i8_rdna2(
 ) -> torch.Tensor:
     """gfx1030 int8 weight-only skinny GEMM, M <= 8."""
     return torch.ops._rocm_C.gemv_i8_rdna2(x, w, scale, bias)
+
+
+def gemm_w8a8_i8_rdna2(
+    x: torch.Tensor,
+    w_i8: torch.Tensor,
+    w_scale: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    design: int = -1,
+) -> torch.Tensor:
+    """gfx1030 native W8A8 sdot4 dense prefill GEMM (per-channel int8 w)."""
+    return torch.ops._rocm_C.gemm_w8a8_i8_rdna2(x, w_i8, w_scale, bias, design)
+
+
+def rdna_hc_up_gate_mix_prefill_i8(
+    dai: torch.Tensor,
+    w_up_i8: torch.Tensor,
+    w_up_scale: torch.Tensor,
+    xn: torch.Tensor,
+    lora_rank: int,
+    hc_count: int,
+) -> torch.Tensor:
+    """gfx1030 native W8A8 sdot4 HC up-GEMM + sigmoid + gated mean."""
+    return torch.ops._rocm_C.rdna_hc_up_gate_mix_prefill_i8(
+        dai, w_up_i8, w_up_scale, xn, lora_rank, hc_count
+    )
 
 
 def rdna_gemv_act(
@@ -6601,6 +7052,114 @@ if hasattr(torch.ops, "_rocm_C") and hasattr(torch.ops._rocm_C, "moe_mxfp8_gemm_
 
 
 if hasattr(torch.ops, "_rocm_C") and hasattr(
+    torch.ops._rocm_C, "moe_nvfp4_gemm_hybrid_rdna2"
+):
+
+    @register_fake("_rocm_C::moe_nvfp4_gemm_hybrid_rdna2")
+    def _moe_nvfp4_gemm_hybrid_rdna2_fake(
+        a: torch.Tensor,
+        c: torch.Tensor,
+        dev_q_weight: torch.Tensor,
+        dev_scales: torch.Tensor,
+        dev_globals: torch.Tensor,
+        host_q_weight: torch.Tensor,
+        host_scales: torch.Tensor,
+        host_globals: torch.Tensor,
+        resident_map: torch.Tensor,
+        topk_weights: torch.Tensor,
+        sorted_token_ids: torch.Tensor,
+        expert_ids: torch.Tensor,
+        num_tokens_post_padded: torch.Tensor,
+        top_k: int,
+        block_size_m: int,
+        mul_topk_weight: bool,
+        output_topk: int,
+    ) -> None:
+        return
+
+
+if hasattr(torch.ops, "_rocm_C") and hasattr(
+    torch.ops._rocm_C, "moe_nvfp4_gemm_swiglu_hybrid_rdna2"
+):
+
+    @register_fake("_rocm_C::moe_nvfp4_gemm_swiglu_hybrid_rdna2")
+    def _moe_nvfp4_gemm_swiglu_hybrid_rdna2_fake(
+        gate_up: torch.Tensor,
+        c: torch.Tensor,
+        dev_q_weight: torch.Tensor,
+        dev_scales: torch.Tensor,
+        dev_globals: torch.Tensor,
+        host_q_weight: torch.Tensor,
+        host_scales: torch.Tensor,
+        host_globals: torch.Tensor,
+        resident_map: torch.Tensor,
+        topk_weights: torch.Tensor,
+        sorted_token_ids: torch.Tensor,
+        expert_ids: torch.Tensor,
+        num_tokens_post_padded: torch.Tensor,
+        top_k: int,
+        block_size_m: int,
+        mul_topk_weight: bool,
+        output_topk: int,
+        gate_cap: float,
+        up_cap: float,
+    ) -> None:
+        return
+
+
+if hasattr(torch.ops, "_rocm_C") and hasattr(
+    torch.ops._rocm_C, "moe_mxfp8_gemm_hybrid_rdna2"
+):
+
+    @register_fake("_rocm_C::moe_mxfp8_gemm_hybrid_rdna2")
+    def _moe_mxfp8_gemm_hybrid_rdna2_fake(
+        a: torch.Tensor,
+        c: torch.Tensor,
+        dev_q_weight: torch.Tensor,
+        dev_scales: torch.Tensor,
+        host_q_weight: torch.Tensor,
+        host_scales: torch.Tensor,
+        resident_map: torch.Tensor,
+        topk_weights: torch.Tensor,
+        sorted_token_ids: torch.Tensor,
+        expert_ids: torch.Tensor,
+        num_tokens_post_padded: torch.Tensor,
+        top_k: int,
+        block_size_m: int,
+        mul_topk_weight: bool,
+        output_topk: int,
+    ) -> None:
+        return
+
+
+if hasattr(torch.ops, "_rocm_C") and hasattr(
+    torch.ops._rocm_C, "moe_mxfp8_gemm_swiglu_hybrid_rdna2"
+):
+
+    @register_fake("_rocm_C::moe_mxfp8_gemm_swiglu_hybrid_rdna2")
+    def _moe_mxfp8_gemm_swiglu_hybrid_rdna2_fake(
+        gate_up: torch.Tensor,
+        c: torch.Tensor,
+        dev_q_weight: torch.Tensor,
+        dev_scales: torch.Tensor,
+        host_q_weight: torch.Tensor,
+        host_scales: torch.Tensor,
+        resident_map: torch.Tensor,
+        topk_weights: torch.Tensor,
+        sorted_token_ids: torch.Tensor,
+        expert_ids: torch.Tensor,
+        num_tokens_post_padded: torch.Tensor,
+        top_k: int,
+        block_size_m: int,
+        mul_topk_weight: bool,
+        output_topk: int,
+        gate_cap: float,
+        up_cap: float,
+    ) -> None:
+        return
+
+
+if hasattr(torch.ops, "_rocm_C") and hasattr(
     torch.ops._rocm_C, "moe_prefill_cta_rdna2"
 ):
 
@@ -6850,8 +7409,9 @@ if hasattr(torch.ops, "_rocm_C") and hasattr(
         out: torch.Tensor,
         x_index: torch.Tensor | None,
         num_rows: int,
-        splits: int,
-        variant: int,
+        splits: int = 0,
+        variant: int = 0,
+        w_row_ids: torch.Tensor | None = None,
     ) -> None:
         return
 
@@ -6862,6 +7422,7 @@ if hasattr(torch.ops, "_rocm_C") and hasattr(
         out: torch.Tensor,
         num_rows: int,
         design: int,
+        w_row_ids: torch.Tensor | None = None,
     ) -> None:
         return
 
@@ -6936,7 +7497,11 @@ if hasattr(torch.ops, "_rocm_C") and hasattr(
 
     @register_fake("_rocm_C::inkling2_dspark_argmax")
     def _inkling2_dspark_argmax_fake(
-        logits: torch.Tensor, out: torch.Tensor, num_rows: int, vocab: int
+        logits: torch.Tensor,
+        out: torch.Tensor,
+        num_rows: int,
+        vocab: int,
+        token_map: torch.Tensor | None = None,
     ) -> None:
         return
 
@@ -6949,6 +7514,7 @@ if hasattr(torch.ops, "_rocm_C") and hasattr(
             num_rows: int,
             vocab: int,
             first_id: int,
+            token_map: torch.Tensor | None = None,
         ) -> None:
             return
 
@@ -7113,6 +7679,55 @@ if hasattr(torch.ops, "_rocm_C") and hasattr(torch.ops._rocm_C, "inkling2_glue_s
     ) -> None:
         return
 
+    if hasattr(torch.ops._rocm_C, "inkling2_glue_attn_res_dual"):
+
+        @register_fake("_rocm_C::inkling2_glue_attn_res_dual")
+        def _inkling2_glue_attn_res_dual_fake(
+            blocks: torch.Tensor,
+            n_blocks: int,
+            x0: torch.Tensor,
+            x1: torch.Tensor | None,
+            partial_out: torch.Tensor | None,
+            append: torch.Tensor | None,
+            query: torch.Tensor,
+            norm_w: torch.Tensor | None,
+            out: torch.Tensor,
+            norm_out2: torch.Tensor | None,
+            eps: float,
+            norm_eps: float,
+        ) -> None:
+            return
+
+    if hasattr(torch.ops._rocm_C, "inkling2_glue_attn_res_sconv"):
+
+        @register_fake("_rocm_C::inkling2_glue_attn_res_sconv")
+        def _inkling2_glue_attn_res_sconv_fake(
+            blocks: torch.Tensor,
+            n_blocks: int,
+            x0: torch.Tensor | None,
+            conv_x: torch.Tensor,
+            conv_w: torch.Tensor,
+            conv_cache: torch.Tensor,
+            block_table: torch.Tensor,
+            seq_idx: torch.Tensor,
+            query_start_loc: torch.Tensor,
+            seq_lens: torch.Tensor,
+            stream_offset: int,
+            num_kv_heads: int,
+            block_size: int,
+            write_state: bool,
+            sconv_out: torch.Tensor | None,
+            partial_out: torch.Tensor | None,
+            append: torch.Tensor | None,
+            query: torch.Tensor,
+            norm_w: torch.Tensor | None,
+            out: torch.Tensor,
+            norm_out2: torch.Tensor | None,
+            eps: float,
+            norm_eps: float,
+        ) -> None:
+            return
+
     @register_fake("_rocm_C::inkling2_glue_msg_gate_down")
     def _inkling2_glue_msg_gate_down_fake(
         h: torch.Tensor,
@@ -7135,6 +7750,24 @@ if hasattr(torch.ops, "_rocm_C") and hasattr(torch.ops._rocm_C, "inkling2_glue_s
         scratch: torch.Tensor | None,
         partials: torch.Tensor | None,
         counters: torch.Tensor | None,
+        norm_eps: float,
+    ) -> None:
+        return
+
+    @register_fake("_rocm_C::inkling2_glue_msg_gate_down_mix")
+    def _inkling2_glue_msg_gate_down_mix_fake(
+        h: torch.Tensor,
+        m: torch.Tensor,
+        wd: torch.Tensor,
+        d: torch.Tensor,
+        wf: torch.Tensor,
+        wg: torch.Tensor,
+        norm_w: torch.Tensor | None,
+        out: torch.Tensor,
+        scratch: torch.Tensor | None,
+        partials: torch.Tensor | None,
+        counters: torch.Tensor | None,
+        eps: float,
         norm_eps: float,
     ) -> None:
         return
@@ -7202,3 +7835,65 @@ if hasattr(torch.ops, "_rocm_C") and hasattr(torch.ops._rocm_C, "inkling2_glue_s
     @register_fake("_rocm_C::inkling2_glue_copy_states")
     def _inkling2_glue_copy_states_fake(src: torch.Tensor, dst: torch.Tensor) -> None:
         return
+
+    if hasattr(torch.ops._rocm_C, "inkling2_glue_loopcd_blend"):
+
+        @register_fake("_rocm_C::inkling2_glue_loopcd_blend")
+        def _inkling2_glue_loopcd_blend_fake(
+            x0: torch.Tensor,
+            x1: torch.Tensor | None,
+            prev_x0: torch.Tensor,
+            prev_x1: torch.Tensor,
+            blk: torch.Tensor | None,
+            prev_blk: torch.Tensor | None,
+            omega: torch.Tensor,
+            omega_blk: torch.Tensor | None,
+        ) -> None:
+            return
+
+    if hasattr(torch.ops._rocm_C, "inkling2_glue_loopcd_readout"):
+
+        @register_fake("_rocm_C::inkling2_glue_loopcd_readout")
+        def _inkling2_glue_loopcd_readout_fake(
+            blocks: torch.Tensor,
+            n_blocks: int,
+            x0: torch.Tensor,
+            x1: torch.Tensor | None,
+            query: torch.Tensor,
+            norm_w: torch.Tensor,
+            out: torch.Tensor,
+            gate_flag: torch.Tensor | None,
+            eps: float,
+            norm_eps: float,
+        ) -> None:
+            return
+
+    if hasattr(torch.ops._rocm_C, "inkling2_loopcd_prepare_hidden"):
+
+        @register_fake("_rocm_C::inkling2_loopcd_prepare_hidden")
+        def _inkling2_loopcd_prepare_hidden_fake(
+            omega_out: torch.Tensor,
+            omega_blk_out: torch.Tensor,
+            idx_mapping: torch.Tensor,
+            query_start_loc: torch.Tensor,
+            seq_lens: torch.Tensor,
+            prefill_len: torch.Tensor,
+            req_alpha: torch.Tensor,
+            req_mode: torch.Tensor,
+            req_blend_blk: torch.Tensor,
+            num_tokens_padded: int,
+        ) -> None:
+            return
+
+    if hasattr(torch.ops._rocm_C, "inkling2_loopcd_logits"):
+
+        @register_fake("_rocm_C::inkling2_loopcd_logits")
+        def _inkling2_loopcd_logits_fake(
+            z_final: torch.Tensor,
+            z_first: torch.Tensor,
+            omega: torch.Tensor,
+            log_beta: torch.Tensor,
+            adaptive: torch.Tensor,
+            stats_scratch: torch.Tensor,
+        ) -> None:
+            return
