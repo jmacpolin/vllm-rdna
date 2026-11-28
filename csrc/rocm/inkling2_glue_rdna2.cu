@@ -70,8 +70,9 @@ constexpr int kWave = 32;
 constexpr int kMaxStates = 64;    // block states (+ append + partial) per call
 constexpr int kMaxExperts = 255;  // expert id is a byte, 0xFF is the pad
 constexpr int kMaxTopK = 16;
-constexpr int kRouteThreads = 256;      // 8 waves, one expert row per wave
-constexpr int kRouteMaxEntries = 8192;  // tokens * top_k of one call
+constexpr int kRouteThreads = 256;       // 8 waves, one expert row per wave
+constexpr int kRouteSmallThreads = 128;  // 4 waves per expert CTA (T <= 4)
+constexpr int kRouteMaxEntries = 8192;   // tokens * top_k of one call
 // align scratch in the router's dynamic LDS: per-wave expert histograms
 // [waves][256], the wave sums of the expert scan, the routed ids as bytes
 constexpr int kAlignOffWs = (kRouteThreads / kWave) * 256 * 4;
@@ -85,18 +86,65 @@ constexpr int kMixWaves = 8;      // waves of a split gate_mix CTA
 constexpr int kMixRpw = 8;        // rows of the gate rank per wave: R = 64
 
 // ---------------------------------------------------------------------------
-// Small helpers (arch independent)
+// Small helpers (wave32 DPP butterflies on gfx1030, bit-identical to shfl_xor)
 // ---------------------------------------------------------------------------
+#if defined(__HIP__RDNA2__)
+template <int O>
+__device__ __forceinline__ int xor_lane_i32(int x) {
+  if constexpr (O == 16)
+    return __builtin_amdgcn_permlanex16(x, x, 0x76543210u, 0xfedcba98u, false,
+                                        false);
+  else if constexpr (O == 8)
+    return __builtin_amdgcn_update_dpp(x, x, 0x168, 0xF, 0xF, false);
+  else if constexpr (O == 4)
+    return __builtin_amdgcn_update_dpp(x, x, 0x164, 0xF, 0xF, false);
+  else if constexpr (O == 2)
+    return __builtin_amdgcn_update_dpp(x, x, 0x4E, 0xF, 0xF, false);
+  else
+    return __builtin_amdgcn_update_dpp(x, x, 0xB1, 0xF, 0xF, false);
+}
+#else
+template <int O>
+__device__ __forceinline__ int xor_lane_i32(int x) {
+  return __shfl_xor(x, O);
+}
+#endif
+
+template <int O>
+__device__ __forceinline__ float xor_lane(float v) {
+  return __int_as_float(xor_lane_i32<O>(__float_as_int(v)));
+}
+
 __device__ __forceinline__ float wave_sum(float v) {
-#pragma unroll
-  for (int o = kWave / 2; o > 0; o >>= 1) v += __shfl_xor(v, o);
+  v += xor_lane<16>(v);
+  v += xor_lane<8>(v);
+  v += xor_lane<4>(v);
+  v += xor_lane<2>(v);
+  v += xor_lane<1>(v);
   return v;
 }
 
 __device__ __forceinline__ float wave_max(float v) {
-#pragma unroll
-  for (int o = kWave / 2; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor(v, o));
+  v = fmaxf(v, xor_lane<16>(v));
+  v = fmaxf(v, xor_lane<8>(v));
+  v = fmaxf(v, xor_lane<4>(v));
+  v = fmaxf(v, xor_lane<2>(v));
+  v = fmaxf(v, xor_lane<1>(v));
   return v;
+}
+
+template <int N>
+__device__ __forceinline__ void wave_sum_n(float (&v)[N]) {
+#pragma unroll
+  for (int i = 0; i < N; ++i) v[i] += xor_lane<16>(v[i]);
+#pragma unroll
+  for (int i = 0; i < N; ++i) v[i] += xor_lane<8>(v[i]);
+#pragma unroll
+  for (int i = 0; i < N; ++i) v[i] += xor_lane<4>(v[i]);
+#pragma unroll
+  for (int i = 0; i < N; ++i) v[i] += xor_lane<2>(v[i]);
+#pragma unroll
+  for (int i = 0; i < N; ++i) v[i] += xor_lane<1>(v[i]);
 }
 
 // All threads of the block get the sum (same order in every thread).
@@ -157,6 +205,22 @@ __device__ __forceinline__ void store4(__half* p, const float4 v) {
   *reinterpret_cast<uint2*>(p) = u;
 }
 
+__device__ __forceinline__ uint16_t f32_to_bf16_rne(float f) {
+  uint32_t u = static_cast<uint32_t>(__float_as_int(f));
+  if ((u & 0x7fffffffu) > 0x7f800000u) return 0x7fc0u;  // NaN
+  u += 0x7fffu + ((u >> 16) & 1u);                      // round to nearest even
+  return static_cast<uint16_t>(u >> 16);
+}
+__device__ __forceinline__ uint32_t pack_bf2(float lo, float hi) {
+  return (uint32_t)f32_to_bf16_rne(lo) | ((uint32_t)f32_to_bf16_rne(hi) << 16);
+}
+__device__ __forceinline__ void store4_bf16(uint16_t* p, const float4 v) {
+  uint2 u;
+  u.x = pack_bf2(v.x, v.y);
+  u.y = pack_bf2(v.z, v.w);
+  *reinterpret_cast<uint2*>(p) = u;
+}
+
 // Element type tag selected by a uniform runtime flag.
 __device__ __forceinline__ float4 load4_dyn(const void* base, int64_t idx,
                                             int is_half) {
@@ -190,8 +254,35 @@ struct AttnResArgs {
   int nw_rows;
   void* out;  // [T, Q, H] fp32 (or fp16 with norm_w)
   int64_t o_t, o_q;
+  void* norm_out2;  // optional [T, H] fp32 or bf16 secondary norm output (Q=1)
+  int64_t no2_t;
+  int no2_bf16;
   int H, n_blocks;
   float eps, norm_eps, inv_h, scale;
+};
+
+struct GlueConvMeta {
+  const int32_t* block_table;  // [R, bt_stride]
+  const int32_t* seq_idx;      // [T_md]
+  const int32_t* qsl;          // [R + 1]
+  const int32_t* seq_lens;     // [R]
+  __half* cache;               // [blocks, nkv, ring, W] fp16
+  int64_t cs0, cs1, cs2;       // strides in halfs
+  int bt_stride, blk_shift, ring, T_md;
+};
+
+struct AttnResSconvArgs {
+  AttnResArgs base;
+  GlueConvMeta cm;
+  const __half* cx;  // [T, H] fp16 conv input
+  int64_t cx_t;
+  const float* cw;   // [H, 1, 4] fp32 conv weight
+  float* sconv_out;  // optional [T, H] fp32 conv output
+  int64_t sco_t;
+  int conv_width;  // H / num_kv_heads
+  int conv_o0;     // stream_offset
+  int conv_wr;     // 1 if write_state else 0
+  float conv_inv;  // 1 / sqrt(5)
 };
 
 #if defined(__HIP__RDNA2__) || !defined(__HIP_DEVICE_COMPILE__)
@@ -211,7 +302,8 @@ __device__ __forceinline__ void state_partials(const float4 (&s)[ITER],
 }
 
 template <int Q, int ITER, bool NORM>
-__device__ __forceinline__ void attn_res_body(const AttnResArgs& a) {
+__device__ __forceinline__ void attn_res_core(const AttnResArgs& a,
+                                              const float4 (&P)[ITER]) {
   constexpr int kNReg = 6;  // states kept in registers between the two passes
   constexpr int kQ1 = Q + 1;
   const int tid = threadIdx.x;
@@ -223,38 +315,20 @@ __device__ __forceinline__ void attn_res_body(const AttnResArgs& a) {
   const int V = a.H >> 2;
 
   __shared__ float s_red[8][kMaxStates * kQ1];
-  __shared__ float s_tot[kMaxStates * kQ1];
-  __shared__ float s_coef[Q][kMaxStates];
 
-  const bool has_x1 = a.x1 != nullptr;
   const bool has_app = a.append != nullptr;
   const int NS = a.n_blocks + (has_app ? 1 : 0) + 1;
   float* brow = a.blocks != nullptr ? a.blocks + t * a.bs_t : nullptr;
 
-  // partial state (last of the stack) and appended block state
-  float4 P[ITER], A[ITER], Qv[Q][ITER];
+  float4 A[ITER], Qv[Q][ITER];
   #pragma unroll
   for (int k = 0; k < ITER; ++k) {
     const int v = tid + k * nth;
-    float4 p = make_float4(0.f, 0.f, 0.f, 0.f);
-    float4 ap = p;
-    if (v < V) {
-      p = load4(a.x0 + t * a.x0_t + 4 * v);
-      if (has_x1) {
-        const float4 q1 = load4(a.x1 + t * a.x1_t + 4 * v);
-        p.x += q1.x;
-        p.y += q1.y;
-        p.z += q1.z;
-        p.w += q1.w;
-      }
-      if (a.partial_out != nullptr)
-        store4(a.partial_out + t * a.po_t + 4 * v, p);
-      if (has_app) {
-        ap = load4(a.append + t * a.ap_t + 4 * v);
-        store4(brow + (int64_t)a.n_blocks * a.bs_s + 4 * v, ap);
-      }
+    float4 ap = make_float4(0.f, 0.f, 0.f, 0.f);
+    if (v < V && has_app) {
+      ap = load4(a.append + t * a.ap_t + 4 * v);
+      store4(brow + (int64_t)a.n_blocks * a.bs_s + 4 * v, ap);
     }
-    P[k] = p;
     A[k] = ap;
   #pragma unroll
     for (int q = 0; q < Q; ++q)
@@ -277,16 +351,18 @@ __device__ __forceinline__ void attn_res_body(const AttnResArgs& a) {
     }
   };
 
-  // pass 1: per state sum of squares and the dot product with every query
+  // pass 1: issue all register-resident state loads together, then reduce
   float4 S[kNReg][ITER];
   #pragma unroll
   for (int j = 0; j < kNReg; ++j) {
+    if (j < NS) fetch(j, S[j]);
+  }
+  #pragma unroll
+  for (int j = 0; j < kNReg; ++j) {
     if (j < NS) {
-      fetch(j, S[j]);
       float v[kQ1];
       state_partials<Q, ITER>(S[j], Qv, v);
-  #pragma unroll
-      for (int i = 0; i < kQ1; ++i) v[i] = wave_sum(v[i]);
+      wave_sum_n<kQ1>(v);
       if (lane == 0) {
   #pragma unroll
         for (int i = 0; i < kQ1; ++i) s_red[wave][j * kQ1 + i] = v[i];
@@ -298,52 +374,56 @@ __device__ __forceinline__ void attn_res_body(const AttnResArgs& a) {
     fetch(j, s);
     float v[kQ1];
     state_partials<Q, ITER>(s, Qv, v);
-  #pragma unroll
-    for (int i = 0; i < kQ1; ++i) v[i] = wave_sum(v[i]);
+    wave_sum_n<kQ1>(v);
     if (lane == 0) {
   #pragma unroll
       for (int i = 0; i < kQ1; ++i) s_red[wave][j * kQ1 + i] = v[i];
     }
   }
   __syncthreads();
-  for (int i = tid; i < NS * kQ1; i += nth) {
-    float acc = 0.f;
-    for (int w = 0; w < nwaves; ++w) acc += s_red[w][i];
-    s_tot[i] = acc;
-  }
-  __syncthreads();
 
-  // scores -> softmax over the states -> coefficients c[q][j] = p[q][j] * r[j]
-  if (wave == 0) {
-    float rr[2];
+  // Every wave independently reduces s_red across waves and computes softmax
+  // coefficients in registers (eliminates s_tot / s_coef LDS and 2 barriers).
+  float rr[2];
+  float tot_q[Q][2];
+  #pragma unroll
+  for (int u = 0; u < 2; ++u) {
+    const int j = lane + kWave * u;
+    if (j < NS) {
+      float s0 = 0.f;
+      for (int w = 0; w < nwaves; ++w) s0 += s_red[w][j * kQ1];
+      rr[u] = rsqrtf(s0 * a.inv_h + a.eps);
+  #pragma unroll
+      for (int q = 0; q < Q; ++q) {
+        float sq = 0.f;
+        for (int w = 0; w < nwaves; ++w) sq += s_red[w][j * kQ1 + 1 + q];
+        tot_q[q][u] = sq;
+      }
+    } else {
+      rr[u] = 0.f;
+  #pragma unroll
+      for (int q = 0; q < Q; ++q) tot_q[q][u] = 0.f;
+    }
+  }
+  float coef[Q][2];
+  #pragma unroll
+  for (int q = 0; q < Q; ++q) {
+    float sc[2], e[2];
   #pragma unroll
     for (int u = 0; u < 2; ++u) {
       const int j = lane + kWave * u;
-      rr[u] = j < NS ? rsqrtf(s_tot[j * kQ1] * a.inv_h + a.eps) : 0.f;
+      sc[u] = j < NS ? (tot_q[q][u] * rr[u]) * a.scale : -INFINITY;
     }
+    const float m = wave_max(fmaxf(sc[0], sc[1]));
   #pragma unroll
-    for (int q = 0; q < Q; ++q) {
-      float sc[2], e[2];
-  #pragma unroll
-      for (int u = 0; u < 2; ++u) {
-        const int j = lane + kWave * u;
-        sc[u] = j < NS ? (s_tot[j * kQ1 + 1 + q] * rr[u]) * a.scale : -INFINITY;
-      }
-      const float m = wave_max(fmaxf(sc[0], sc[1]));
-  #pragma unroll
-      for (int u = 0; u < 2; ++u) {
-        const int j = lane + kWave * u;
-        e[u] = j < NS ? expf(sc[u] - m) : 0.f;
-      }
-      const float den = wave_sum(e[0] + e[1]);
-  #pragma unroll
-      for (int u = 0; u < 2; ++u) {
-        const int j = lane + kWave * u;
-        if (j < NS) s_coef[q][j] = (e[u] / den) * rr[u];
-      }
+    for (int u = 0; u < 2; ++u) {
+      const int j = lane + kWave * u;
+      e[u] = j < NS ? expf(sc[u] - m) : 0.f;
     }
+    const float den = wave_sum(e[0] + e[1]);
+  #pragma unroll
+    for (int u = 0; u < 2; ++u) coef[q][u] = (e[u] / den) * rr[u];
   }
-  __syncthreads();
 
   // pass 2: out[q] = sum_j c[q][j] * state_j
   float4 acc[Q][ITER];
@@ -356,7 +436,7 @@ __device__ __forceinline__ void attn_res_body(const AttnResArgs& a) {
     if (j < NS) {
   #pragma unroll
       for (int q = 0; q < Q; ++q) {
-        const float c = s_coef[q][j];
+        const float c = __shfl(coef[q][0], j);
   #pragma unroll
         for (int k = 0; k < ITER; ++k) acc[q][k] = fma4(c, S[j][k], acc[q][k]);
       }
@@ -367,7 +447,8 @@ __device__ __forceinline__ void attn_res_body(const AttnResArgs& a) {
     fetch(j, s);
   #pragma unroll
     for (int q = 0; q < Q; ++q) {
-      const float c = s_coef[q][j];
+      const float c =
+          (j < kWave) ? __shfl(coef[q][0], j) : __shfl(coef[q][1], j - kWave);
   #pragma unroll
       for (int k = 0; k < ITER; ++k) acc[q][k] = fma4(c, s[k], acc[q][k]);
     }
@@ -390,12 +471,26 @@ __device__ __forceinline__ void attn_res_body(const AttnResArgs& a) {
       float s = 0.f;
   #pragma unroll
       for (int k = 0; k < ITER; ++k) s += dot4(acc[q][k], acc[q][k]);
-      ssq[q] = wave_sum(s);
+      ssq[q] = s;
     }
-    __syncthreads();
+    wave_sum_n<Q>(ssq);
     if (lane == 0) {
   #pragma unroll
       for (int q = 0; q < Q; ++q) s_nrm[wave][q] = ssq[q];
+    }
+    // Prefetch norm weights while waves arrive at the single norm barrier.
+    float4 nw[Q][ITER];
+  #pragma unroll
+    for (int q = 0; q < Q; ++q) {
+      if (q == 0 || a.nw_rows > 1) {
+        const int64_t wrow = (a.nw_rows == 1 ? 0 : q) * a.nw_s;
+  #pragma unroll
+        for (int k = 0; k < ITER; ++k) {
+          const int v = tid + k * nth;
+          nw[q][k] = v < V ? load4_dyn(a.norm_w, wrow + 4 * v, a.nw_f16)
+                           : make_float4(0.f, 0.f, 0.f, 0.f);
+        }
+      }
     }
     __syncthreads();
     float rs[Q];
@@ -408,20 +503,212 @@ __device__ __forceinline__ void attn_res_body(const AttnResArgs& a) {
     __half* out = reinterpret_cast<__half*>(a.out) + t * a.o_t;
   #pragma unroll
     for (int q = 0; q < Q; ++q) {
-      const int64_t wrow = (a.nw_rows == 1 ? 0 : q) * a.nw_s;
   #pragma unroll
       for (int k = 0; k < ITER; ++k) {
         const int v = tid + k * nth;
         if (v < V) {
-          const float4 w = load4_dyn(a.norm_w, wrow + 4 * v, a.nw_f16);
+          const float4 w = (a.nw_rows == 1) ? nw[0][k] : nw[q][k];
           const float4 y = make_float4(
               w.x * (acc[q][k].x * rs[q]), w.y * (acc[q][k].y * rs[q]),
               w.z * (acc[q][k].z * rs[q]), w.w * (acc[q][k].w * rs[q]));
           store4(out + (int64_t)q * a.o_q + 4 * v, y);
+          if constexpr (Q == 1) {
+            if (a.norm_out2 != nullptr) {
+              if (a.no2_bf16) {
+                store4_bf16(reinterpret_cast<uint16_t*>(a.norm_out2) +
+                                t * a.no2_t + 4 * v,
+                            y);
+              } else {
+                store4(
+                    reinterpret_cast<float*>(a.norm_out2) + t * a.no2_t + 4 * v,
+                    y);
+              }
+            }
+          }
         }
       }
     }
   }
+}
+
+template <int Q, int ITER, bool NORM>
+__device__ __forceinline__ void attn_res_body(const AttnResArgs& a) {
+  const int tid = threadIdx.x;
+  const int nth = blockDim.x;
+  const int64_t t = blockIdx.x;
+  const int V = a.H >> 2;
+  const bool has_x1 = a.x1 != nullptr;
+  float4 P[ITER];
+  #pragma unroll
+  for (int k = 0; k < ITER; ++k) {
+    const int v = tid + k * nth;
+    float4 p = make_float4(0.f, 0.f, 0.f, 0.f);
+    if (v < V) {
+      p = load4(a.x0 + t * a.x0_t + 4 * v);
+      if (has_x1) {
+        const float4 q1 = load4(a.x1 + t * a.x1_t + 4 * v);
+        p.x += q1.x;
+        p.y += q1.y;
+        p.z += q1.z;
+        p.w += q1.w;
+      }
+      if (a.partial_out != nullptr)
+        store4(a.partial_out + t * a.po_t + 4 * v, p);
+    }
+    P[k] = p;
+  }
+  attn_res_core<Q, ITER, NORM>(a, P);
+}
+
+// SCONV_MODE 1: partial = x0 + sconv(cx)
+// SCONV_MODE 2: partial = sconv(cx) (boundary layer mlp_input, x0 == nullptr)
+// Computing P[ITER] in an isolated prologue scope before loading Qv / S keeps
+// conv weights + history taps dead during the state reduction (~104 VGPRs vs
+// 164 VGPRs when all loads overlap).
+template <int Q, int ITER, bool NORM, int SCONV_MODE>
+__device__ __forceinline__ void attn_res_sconv_body(
+    const AttnResSconvArgs& sa) {
+  const AttnResArgs& a = sa.base;
+  const int tid = threadIdx.x;
+  const int nth = blockDim.x;
+  const int64_t t = blockIdx.x;
+  const int V = a.H >> 2;
+  float4 P[ITER];
+  {
+    int cr = -1;
+    int qs = 0, tp_p = 0, tp_p1 = 0;
+    bool keep = false;
+    int blk_cur = 0;
+    bool h_use_x[3] = {false, false, false};
+    bool h_valid[3] = {false, false, false};
+    int64_t h_base[3] = {0, 0, 0};
+    if (t < sa.cm.T_md) {
+      cr = sa.cm.seq_idx[t];
+      if (cr >= 0) {
+        qs = sa.cm.qsl[cr];
+        tp_p1 = sa.cm.seq_lens[cr];
+        tp_p = tp_p1 - (sa.cm.qsl[cr + 1] - qs) + ((int)t - qs);
+        if (sa.conv_wr && tp_p >= 0 && tp_p < tp_p1) {
+          const int blk_end = ((tp_p >> sa.cm.blk_shift) + 1)
+                              << sa.cm.blk_shift;
+          keep = (tp_p + sa.cm.ring >= min(tp_p1, blk_end));
+        }
+        const int bt_row = cr * sa.cm.bt_stride;
+        if (keep) {
+          blk_cur =
+              sa.cm.block_table[bt_row + (max(tp_p, 0) >> sa.cm.blk_shift)];
+        }
+  #pragma unroll
+        for (int lag = 1; lag < 4; ++lag) {
+          const int sr = (int)t - lag;
+          const int sp = tp_p - lag;
+          const bool ux = sr >= qs;
+          h_use_x[lag - 1] = ux;
+          h_valid[lag - 1] = ux || sp >= 0;
+          if (ux) {
+            h_base[lag - 1] = (int64_t)sr * sa.cx_t;
+          } else if (sp >= 0) {
+            const int b = sa.cm.block_table[bt_row + (sp >> sa.cm.blk_shift)];
+            h_base[lag - 1] = (int64_t)b * sa.cm.cs0 +
+                              (int64_t)(sp % sa.cm.ring) * sa.cm.cs2 +
+                              sa.conv_o0;
+          }
+        }
+      }
+    }
+
+    uint2 xh[ITER];
+    uint2 hh[ITER][3];
+    float4 wc[ITER][4];
+    float4 x0v[ITER];
+  #pragma unroll
+    for (int k = 0; k < ITER; ++k) {
+      const int v = tid + k * nth;
+      xh[k] = make_uint2(0u, 0u);
+      hh[k][0] = hh[k][1] = hh[k][2] = make_uint2(0u, 0u);
+      x0v[k] = make_float4(0.f, 0.f, 0.f, 0.f);
+      if (v < V) {
+        const int c = 4 * v;
+        if constexpr (SCONV_MODE == 1) {
+          x0v[k] = load4(a.x0 + t * a.x0_t + c);
+        }
+        if (cr >= 0) {
+          xh[k] = *reinterpret_cast<const uint2*>(sa.cx + t * sa.cx_t + c);
+          const int h = c / sa.conv_width;
+          const int jch = c - h * sa.conv_width;
+  #pragma unroll
+          for (int i = 0; i < 3; ++i) {
+            if (h_valid[i]) {
+              const __half* src = h_use_x[i] ? (sa.cx + h_base[i] + c)
+                                             : (sa.cm.cache + h_base[i] +
+                                                (int64_t)h * sa.cm.cs1 + jch);
+              hh[k][i] = *reinterpret_cast<const uint2*>(src);
+            }
+          }
+          const float* wp = sa.cw + (int64_t)c * 4;
+          wc[k][0] = load4(wp);
+          wc[k][1] = load4(wp + 4);
+          wc[k][2] = load4(wp + 8);
+          wc[k][3] = load4(wp + 12);
+        }
+      }
+    }
+
+  #pragma unroll
+    for (int k = 0; k < ITER; ++k) {
+      const int v = tid + k * nth;
+      float4 p = make_float4(0.f, 0.f, 0.f, 0.f);
+      if (v < V) {
+        const int c = 4 * v;
+        float4 cv = make_float4(0.f, 0.f, 0.f, 0.f);
+        if (cr >= 0) {
+          const float4 t0 = make_float4(h2f_lo(xh[k].x), h2f_hi(xh[k].x),
+                                        h2f_lo(xh[k].y), h2f_hi(xh[k].y));
+          const float4 t1 = make_float4(h2f_lo(hh[k][0].x), h2f_hi(hh[k][0].x),
+                                        h2f_lo(hh[k][0].y), h2f_hi(hh[k][0].y));
+          const float4 t2 = make_float4(h2f_lo(hh[k][1].x), h2f_hi(hh[k][1].x),
+                                        h2f_lo(hh[k][1].y), h2f_hi(hh[k][1].y));
+          const float4 t3 = make_float4(h2f_lo(hh[k][2].x), h2f_hi(hh[k][2].x),
+                                        h2f_lo(hh[k][2].y), h2f_hi(hh[k][2].y));
+          cv.x = t0.x * wc[k][0].w + t1.x * wc[k][0].z + t2.x * wc[k][0].y +
+                 t3.x * wc[k][0].x;
+          cv.y = t0.y * wc[k][1].w + t1.y * wc[k][1].z + t2.y * wc[k][1].y +
+                 t3.y * wc[k][1].x;
+          cv.z = t0.z * wc[k][2].w + t1.z * wc[k][2].z + t2.z * wc[k][2].y +
+                 t3.z * wc[k][2].x;
+          cv.w = t0.w * wc[k][3].w + t1.w * wc[k][3].z + t2.w * wc[k][3].y +
+                 t3.w * wc[k][3].x;
+          cv.x = (cv.x + t0.x) * sa.conv_inv;
+          cv.y = (cv.y + t0.y) * sa.conv_inv;
+          cv.z = (cv.z + t0.z) * sa.conv_inv;
+          cv.w = (cv.w + t0.w) * sa.conv_inv;
+          if (keep && blk_cur > 0) {
+            const int h = c / sa.conv_width;
+            const int jch = c - h * sa.conv_width;
+            __half* dst = sa.cm.cache + (int64_t)blk_cur * sa.cm.cs0 +
+                          (int64_t)h * sa.cm.cs1 +
+                          (int64_t)(tp_p % sa.cm.ring) * sa.cm.cs2 +
+                          sa.conv_o0 + jch;
+            store4(dst, t0);
+          }
+        }
+        if (sa.sconv_out != nullptr) {
+          store4(sa.sconv_out + t * sa.sco_t + c, cv);
+        }
+        if constexpr (SCONV_MODE == 1) {
+          p = make_float4(x0v[k].x + cv.x, x0v[k].y + cv.y, x0v[k].z + cv.z,
+                          x0v[k].w + cv.w);
+        } else {
+          p = cv;
+        }
+        if (a.partial_out != nullptr) {
+          store4(a.partial_out + t * a.po_t + c, p);
+        }
+      }
+      P[k] = p;
+    }
+  }
+  attn_res_core<Q, ITER, NORM>(a, P);
 }
 
 #endif  // __HIP__RDNA2__ || !__HIP_DEVICE_COMPILE__
@@ -430,6 +717,14 @@ template <int Q, int ITER, bool NORM>
 __global__ void __launch_bounds__(256) attn_res_kernel(const AttnResArgs a) {
 #if defined(__HIP__RDNA2__) || !defined(__HIP_DEVICE_COMPILE__)
   attn_res_body<Q, ITER, NORM>(a);
+#endif
+}
+
+template <int Q, int ITER, bool NORM, int SCONV_MODE>
+__global__ void __launch_bounds__(256)
+    attn_res_sconv_kernel(const AttnResSconvArgs sa) {
+#if defined(__HIP__RDNA2__) || !defined(__HIP_DEVICE_COMPILE__)
+  attn_res_sconv_body<Q, ITER, NORM, SCONV_MODE>(sa);
 #endif
 }
 
@@ -888,6 +1183,270 @@ __global__ void __launch_bounds__(kMixWaves* kWave)
 }
 
 // ---------------------------------------------------------------------------
+// Fused MessageGate (down + mix + RMSNorm in 1 launch, 8 down CTAs)
+// ---------------------------------------------------------------------------
+struct GateFusedArgs {
+  const float* h;
+  int64_t h_t, h_s;
+  const float* m;
+  int64_t m_t, m_s;
+  const __half* wd;  // [G, R, 2H]
+  __half* d;         // [G, T, R] scratch
+  const float* wf;   // fp32 [G, R, H]
+  const float* wg;   // fp32 [G, R, H]
+  const void* nw;    // [1 or G, H] fp16/fp32
+  int64_t nw_s;
+  int nw_f16, nw_rows;
+  float* out32;   // [G, T, H]
+  __half* out16;  // [G, T, H]
+  float* part;    // [G, T, C]
+  int* counters;  // [2, G, ntiles] (0: mix done, 1: down done)
+  int T, R, H, C;
+  float eps, norm_eps, inv_h;
+};
+
+#if defined(__HIP__RDNA2__) || !defined(__HIP_DEVICE_COMPILE__)
+
+template <int TB, int RPW, bool NORM>
+__device__ __forceinline__ void gate_down_mix_fused_body(
+    const GateFusedArgs& a) {
+  constexpr int NW = kMixWaves;  // 8
+  constexpr int WPT = NW / TB;
+  constexpr int kDownCtas = 8;
+  __shared__ int s_last;
+  extern __shared__ __attribute__((aligned(16))) unsigned char smem[];
+
+  const int tid = threadIdx.x;
+  const int lane = tid & (kWave - 1);
+  const int wave = tid / kWave;
+  const int s = blockIdx.y;
+  const int tile = blockIdx.z;
+  const int t0 = tile * TB;
+  const int cc = blockIdx.x;  // 0..C-1 (128-col chunk)
+  const int c = cc * 128 + lane * 4;
+  const bool active = c < a.H;
+  const int H = a.H, V = H >> 2, K2 = 2 * H, R = a.R, T = a.T;
+  const int r0 = wave * RPW;
+  const int ntiles = gridDim.z;
+  int* mix_counter = a.counters + (int64_t)s * ntiles + tile;
+  int* down_counter = a.counters + (int64_t)(gridDim.y + s) * ntiles + tile;
+
+  // Phase 1: CTAs 0..7 (8 CTAs x 8 waves = 64 waves) compute d[s, t, 0..63]
+  if (cc < kDownCtas) {
+    __half* xs = reinterpret_cast<__half*>(smem);  // [TB][2H]
+    for (int vi = wave; vi < 2 * TB; vi += NW) {
+      const int tb = vi >> 1, which = vi & 1;
+      const int t = t0 + tb;
+      __half* dst = xs + (int64_t)tb * K2 + which * H;
+      if (t >= T) {
+        for (int c4 = lane; c4 < V; c4 += kWave)
+          *reinterpret_cast<uint2*>(dst + 4 * c4) = make_uint2(0u, 0u);
+        continue;
+      }
+      const float* src = which ? a.m + t * a.m_t + (int64_t)s * a.m_s
+                               : a.h + t * a.h_t + (int64_t)s * a.h_s;
+      stage_unit_row(src, dst, V, a.inv_h, a.eps, lane);
+    }
+    __syncthreads();
+
+    const uint4* x4 = reinterpret_cast<const uint4*>(xs);
+    const int K8 = K2 >> 3;
+    const int r = cc * NW + wave;
+    if (r < R) {
+      const uint4* w4 =
+          reinterpret_cast<const uint4*>(a.wd + ((int64_t)s * R + r) * K2);
+      float acc[TB];
+  #pragma unroll
+      for (int tb = 0; tb < TB; ++tb) acc[tb] = 0.f;
+  #pragma unroll 6
+      for (int i = lane; i < K8; i += kWave) {
+        const uint4 wv = w4[i];
+        const half2* wh = reinterpret_cast<const half2*>(&wv);
+  #pragma unroll
+        for (int tb = 0; tb < TB; ++tb) {
+          const uint4 xv = x4[(int64_t)tb * K8 + i];
+          const half2* xh = reinterpret_cast<const half2*>(&xv);
+          float cv = acc[tb];
+          cv = __builtin_amdgcn_fdot2(wh[0], xh[0], cv, false);
+          cv = __builtin_amdgcn_fdot2(wh[1], xh[1], cv, false);
+          cv = __builtin_amdgcn_fdot2(wh[2], xh[2], cv, false);
+          cv = __builtin_amdgcn_fdot2(wh[3], xh[3], cv, false);
+          acc[tb] = cv;
+        }
+      }
+  #pragma unroll
+      for (int tb = 0; tb < TB; ++tb) {
+        const float sum = wave_sum(acc[tb]);
+        const int t = t0 + tb;
+        if (lane == 0 && t < T)
+          a.d[((int64_t)s * T + t) * R + r] = __float2half_rn(sum);
+      }
+    }
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) atomicAdd(down_counter, 1);
+  }
+
+  // Overlap Phase 2 weight/input loads while waiting for all 8 down CTAs
+  float4 fv[RPW], gv[RPW];
+  if (active) {
+    const float* wf = a.wf + (int64_t)s * R * H + c;
+    const float* wg = a.wg + (int64_t)s * R * H + c;
+  #pragma unroll
+    for (int i = 0; i < RPW; ++i) {
+      fv[i] = load4(wf + (int64_t)(r0 + i) * H);
+      gv[i] = load4(wg + (int64_t)(r0 + i) * H);
+    }
+  }
+  float4 hv = make_float4(0.f, 0.f, 0.f, 0.f), mv = hv;
+  if (wave < TB && active && t0 + wave < T) {
+    hv = load4(a.h + (t0 + wave) * a.h_t + (int64_t)s * a.h_s + c);
+    mv = load4(a.m + (t0 + wave) * a.m_t + (int64_t)s * a.m_s + c);
+  }
+
+  if (tid == 0) {
+    while (atomicAdd(down_counter, 0) < kDownCtas) {
+      __builtin_amdgcn_s_sleep(1);
+    }
+    __threadfence();
+  }
+  __syncthreads();
+
+  float dd[TB][RPW];
+  #pragma unroll
+  for (int tb = 0; tb < TB; ++tb) {
+    const int tc = min(t0 + tb, T - 1);
+  #pragma unroll
+    for (int i = 0; i < RPW; ++i)
+      dd[tb][i] = __half2float(a.d[((int64_t)s * T + tc) * R + r0 + i]);
+  }
+
+  float accf[TB][4], accg[TB][4];
+  #pragma unroll
+  for (int tb = 0; tb < TB; ++tb)
+  #pragma unroll
+    for (int j = 0; j < 4; ++j) accf[tb][j] = accg[tb][j] = 0.f;
+  if (active) {
+  #pragma unroll
+    for (int i = 0; i < RPW; ++i) {
+  #pragma unroll
+      for (int tb = 0; tb < TB; ++tb) {
+        const float dr = dd[tb][i];
+        accf[tb][0] = fmaf(dr, fv[i].x, accf[tb][0]);
+        accf[tb][1] = fmaf(dr, fv[i].y, accf[tb][1]);
+        accf[tb][2] = fmaf(dr, fv[i].z, accf[tb][2]);
+        accf[tb][3] = fmaf(dr, fv[i].w, accf[tb][3]);
+        accg[tb][0] = fmaf(dr, gv[i].x, accg[tb][0]);
+        accg[tb][1] = fmaf(dr, gv[i].y, accg[tb][1]);
+        accg[tb][2] = fmaf(dr, gv[i].z, accg[tb][2]);
+        accg[tb][3] = fmaf(dr, gv[i].w, accg[tb][3]);
+      }
+    }
+  }
+
+  float4(*s_part)[TB][2][kWave] =
+      reinterpret_cast<float4(*)[TB][2][kWave]>(smem);
+  #pragma unroll
+  for (int tb = 0; tb < TB; ++tb) {
+    s_part[wave][tb][0][lane] =
+        make_float4(accf[tb][0], accf[tb][1], accf[tb][2], accf[tb][3]);
+    s_part[wave][tb][1][lane] =
+        make_float4(accg[tb][0], accg[tb][1], accg[tb][2], accg[tb][3]);
+  }
+  __syncthreads();
+
+  if (wave < TB) {
+    const int t = t0 + wave;
+    float4 f = make_float4(0.f, 0.f, 0.f, 0.f), g = f;
+  #pragma unroll
+    for (int w = 0; w < NW; ++w) {
+      const float4 pf = s_part[w][wave][0][lane];
+      const float4 pg = s_part[w][wave][1][lane];
+      f.x += pf.x;
+      f.y += pf.y;
+      f.z += pf.z;
+      f.w += pf.w;
+      g.x += pg.x;
+      g.y += pg.y;
+      g.z += pg.z;
+      g.w += pg.w;
+    }
+    float ss = 0.f;
+    if (active && t < T) {
+      float4 o;
+      o.x = (1.0f - tanhf(f.x)) * hv.x + tanhf(g.x) * mv.x;
+      o.y = (1.0f - tanhf(f.y)) * hv.y + tanhf(g.y) * mv.y;
+      o.z = (1.0f - tanhf(f.z)) * hv.z + tanhf(g.z) * mv.z;
+      o.w = (1.0f - tanhf(f.w)) * hv.w + tanhf(g.w) * mv.w;
+      store4(a.out32 + ((int64_t)s * T + t) * H + c, o);
+      ss = dot4(o, o);
+    }
+    if constexpr (NORM) {
+      const float tot = wave_sum(ss);
+      if (lane == 0 && t < T && cc < a.C)
+        a.part[((int64_t)s * T + t) * a.C + cc] = tot;
+    }
+  }
+  if constexpr (!NORM) {
+    __syncthreads();
+    if (tid == 0) {
+      const int old = atomicAdd(mix_counter, 1);
+      if (old == (int)gridDim.x - 1) {
+        *mix_counter = 0;
+        *down_counter = 0;
+      }
+    }
+    return;
+  }
+
+  __threadfence();
+  __syncthreads();
+  if (tid == 0) {
+    const int old = atomicAdd(mix_counter, 1);
+    s_last = (old == (int)gridDim.x - 1);
+  }
+  __syncthreads();
+  if (!s_last) return;
+  __threadfence();
+
+  {
+    const int tb = wave / WPT, sw = wave - tb * WPT;
+    const int t = t0 + tb;
+    if (t < T) {
+      const float* pp = a.part + ((int64_t)s * T + t) * a.C;
+      float tot = 0.f;
+      for (int i = lane; i < a.C; i += kWave) tot += pp[i];
+      tot = wave_sum(tot);
+      const float rs = rsqrtf(tot * a.inv_h + a.norm_eps);
+      const int64_t row = ((int64_t)s * T + t) * H;
+      const int64_t wrow = (a.nw_rows == 1 ? 0 : s) * a.nw_s;
+      for (int c4 = sw * kWave + lane; c4 < (H >> 2); c4 += WPT * kWave) {
+        const float4 v = load4(a.out32 + row + 4 * c4);
+        const float4 w = load4_dyn(a.nw, wrow + 4 * c4, a.nw_f16);
+        store4(a.out16 + row + 4 * c4,
+               make_float4(w.x * (v.x * rs), w.y * (v.y * rs), w.z * (v.z * rs),
+                           w.w * (v.w * rs)));
+      }
+    }
+  }
+  __syncthreads();
+  if (tid == 0) {
+    *mix_counter = 0;
+    *down_counter = 0;
+  }
+}
+
+#endif  // __HIP__RDNA2__ || !__HIP_DEVICE_COMPILE__
+
+template <int TB, int RPW, bool NORM>
+__global__ void __launch_bounds__(kMixWaves* kWave)
+    gate_down_mix_fused_kernel(const GateFusedArgs a) {
+#if defined(__HIP__RDNA2__) || !defined(__HIP_DEVICE_COMPILE__)
+  gate_down_mix_fused_body<TB, RPW, NORM>(a);
+#endif
+}
+
+// ---------------------------------------------------------------------------
 // rms_norm / embed_norm
 // ---------------------------------------------------------------------------
 struct RmsArgs {
@@ -1055,24 +1614,33 @@ __global__ void __launch_bounds__(256) swiglu_kernel(const SwigluArgs a) {
 }
 
 // ---------------------------------------------------------------------------
-// copy_states: [T, P, H] fp32 -> [T, P, H] fp32 (snapshots of persistent
-// states)
+// copy_states: [T, P, H] fp32 -> [T, P, H] fp32 or bf16 (snapshots of
+// persistent states and DSpark partial-block taps)
 // ---------------------------------------------------------------------------
 struct CopyArgs {
   const float* src;
-  float* dst;
+  void* dst;
   int64_t s_t, s_p, d_t, d_p;  // row strides in elements
   int P, H;
 };
 
-template <int DUMMY = 0>
+template <bool DST_BF16 = false>
 __global__ void __launch_bounds__(256) copy_states_kernel(const CopyArgs a) {
 #if defined(__HIP__RDNA2__) || !defined(__HIP_DEVICE_COMPILE__)
   const int t = blockIdx.x / a.P, p = blockIdx.x - t * a.P;
   const float4* s =
       reinterpret_cast<const float4*>(a.src + t * a.s_t + p * a.s_p);
-  float4* d = reinterpret_cast<float4*>(a.dst + t * a.d_t + p * a.d_p);
-  for (int i = threadIdx.x; i < (a.H >> 2); i += 256) d[i] = s[i];
+  if constexpr (DST_BF16) {
+    uint16_t* d = reinterpret_cast<uint16_t*>(a.dst) + (int64_t)t * a.d_t +
+                  (int64_t)p * a.d_p;
+    for (int i = threadIdx.x; i < (a.H >> 2); i += 256)
+      store4_bf16(d + 4 * i, s[i]);
+  } else {
+    float4* d =
+        reinterpret_cast<float4*>(reinterpret_cast<float*>(a.dst) +
+                                  (int64_t)t * a.d_t + (int64_t)p * a.d_p);
+    for (int i = threadIdx.x; i < (a.H >> 2); i += 256) d[i] = s[i];
+  }
 #endif
 }
 
@@ -1102,7 +1670,11 @@ struct RouteArgs {
 #if defined(__HIP__RDNA2__) || !defined(__HIP_DEVICE_COMPILE__)
 
 // Top-k of the token handled by this wave (experts lane, lane + 32, ...).
-__device__ __forceinline__ void route_topk_wave(const RouteArgs& a, int t) {
+// When `flat_ids_out != nullptr`, also writes the selected expert ids as bytes
+// into LDS (`flat_ids_out[t * K + k]`) so small-T align avoids a global
+// readback.
+__device__ __forceinline__ void route_topk_wave(
+    const RouteArgs& a, int t, uint8_t* flat_ids_out = nullptr) {
   constexpr int kMaxEpl = (kMaxExperts + kWave - 1) / kWave;
   const int lane = threadIdx.x & (kWave - 1);
   const int epl = (a.E + kWave - 1) / kWave;
@@ -1121,6 +1693,12 @@ __device__ __forceinline__ void route_topk_wave(const RouteArgs& a, int t) {
   __shared__ int s_sel_id[kRouteThreads / kWave][kMaxTopK];
   __shared__ float s_sel_w[kRouteThreads / kWave][kMaxTopK];
   const int wave = threadIdx.x / kWave;
+  auto step_max = [](float& bv, int& bi, float ov, int oi) {
+    if (ov > bv || (ov == bv && oi < bi)) {
+      bv = ov;
+      bi = oi;
+    }
+  };
   for (int k = 0; k < a.K; ++k) {
     float bv = -INFINITY;
     int bi = 0x7fffffff;
@@ -1131,15 +1709,11 @@ __device__ __forceinline__ void route_topk_wave(const RouteArgs& a, int t) {
         bi = lane + kWave * i;
       }
     }
-  #pragma unroll
-    for (int o = kWave / 2; o > 0; o >>= 1) {
-      const float ov = __shfl_xor(bv, o);
-      const int oi = __shfl_xor(bi, o);
-      if (ov > bv || (ov == bv && oi < bi)) {
-        bv = ov;
-        bi = oi;
-      }
-    }
+    step_max(bv, bi, xor_lane<16>(bv), xor_lane_i32<16>(bi));
+    step_max(bv, bi, xor_lane<8>(bv), xor_lane_i32<8>(bi));
+    step_max(bv, bi, xor_lane<4>(bv), xor_lane_i32<4>(bi));
+    step_max(bv, bi, xor_lane<2>(bv), xor_lane_i32<2>(bi));
+    step_max(bv, bi, xor_lane<1>(bv), xor_lane_i32<1>(bi));
     // NaN scores never win a comparison: keep the id a valid expert index
     if (bi >= a.E) bi = a.E - 1;
     float mine = 0.f;
@@ -1150,7 +1724,7 @@ __device__ __forceinline__ void route_topk_wave(const RouteArgs& a, int t) {
         bs[i] = -INFINITY;
       }
     }
-    const float sval = wave_sum(mine);  // only the owner lane is non-zero
+    const float sval = __shfl(mine, bi & (kWave - 1));
     if (lane == 0) {
       s_sel_id[wave][k] = bi;
       s_sel_w[wave][k] = sval;
@@ -1161,8 +1735,10 @@ __device__ __forceinline__ void route_topk_wave(const RouteArgs& a, int t) {
     for (int k = 0; k < a.K; ++k) sum += s_sel_w[wave][k];
     const float den = sum + 1e-20f;
     for (int k = 0; k < a.K; ++k) {
-      a.topk_ids[(int64_t)t * a.K + k] = s_sel_id[wave][k];
+      const int id = s_sel_id[wave][k];
+      a.topk_ids[(int64_t)t * a.K + k] = id;
       a.topk_w[(int64_t)t * a.K + k] = (s_sel_w[wave][k] / den) * a.route_scale;
+      if (flat_ids_out != nullptr) flat_ids_out[t * a.K + k] = (uint8_t)id;
     }
   }
 }
@@ -1396,6 +1972,168 @@ __device__ __forceinline__ void moe_route_body(const RouteArgs& a) {
   if (tid == 0) a.counters[a.NT] = 0;
 }
 
+// Small-T router (T <= 8, decode & speculative verification): 1 expert per CTA
+// (4 waves = 128 threads splitting H across all E CTAs -> 128 CTAs across 72
+// CUs instead of 16, zero dynamic LDS, direct cached x reads), ONE global
+// barrier, and an in-LDS O(T*K) align without histogram/ballot/sort passes.
+template <typename WT, int TB>
+__device__ __forceinline__ void moe_route_small_body(const RouteArgs& a) {
+  __shared__ float s_part[4][TB];
+  __shared__ int s_flag;
+  __shared__ uint8_t s_flat_ids[8 * kMaxTopK];
+  __shared__ int s_ws[8];
+  const int tid = threadIdx.x;
+  const int lane = tid & (kWave - 1);
+  const int wave = tid / kWave;
+  const int bid = blockIdx.x;
+
+  if (bid < a.nzero) {
+    const int64_t n1 = a.zero1_n >> 3, n2 = a.zero2_n >> 3;
+    for (int64_t i = (int64_t)bid * kRouteSmallThreads + tid; i < n1 + n2;
+         i += (int64_t)a.nzero * kRouteSmallThreads) {
+      uint4* p = i < n1 ? reinterpret_cast<uint4*>(a.zero1) + i
+                        : reinterpret_cast<uint4*>(a.zero2) + (i - n1);
+      *p = make_uint4(0u, 0u, 0u, 0u);
+    }
+    return;
+  }
+
+  const int e = bid - a.nzero;
+  const int H = a.H, E = a.E;
+  float acc[TB];
+  #pragma unroll
+  for (int tb = 0; tb < TB; ++tb) acc[tb] = 0.f;
+
+  if constexpr (std::is_same_v<WT, float>) {
+    const int V = H >> 2;
+    const float4* w4 = reinterpret_cast<const float4*>(a.w) + (int64_t)e * V;
+  #pragma unroll 4
+    for (int i = tid; i < V; i += kRouteSmallThreads) {
+      const float4 wv = w4[i];
+  #pragma unroll
+      for (int tb = 0; tb < TB; ++tb) {
+        if (tb < a.T) {
+          const uint2 u = *reinterpret_cast<const uint2*>(
+              a.x + (int64_t)tb * a.x_t + 4 * i);
+          acc[tb] = fmaf(wv.x, h2f_lo(u.x), acc[tb]);
+          acc[tb] = fmaf(wv.y, h2f_hi(u.x), acc[tb]);
+          acc[tb] = fmaf(wv.z, h2f_lo(u.y), acc[tb]);
+          acc[tb] = fmaf(wv.w, h2f_hi(u.y), acc[tb]);
+        }
+      }
+    }
+  } else {
+    const int H8 = H >> 3;
+    const uint4* w8 = reinterpret_cast<const uint4*>(a.w) + (int64_t)e * H8;
+  #pragma unroll 4
+    for (int i = tid; i < H8; i += kRouteSmallThreads) {
+      const uint4 wv = w8[i];
+      const half2* wh = reinterpret_cast<const half2*>(&wv);
+  #pragma unroll
+      for (int tb = 0; tb < TB; ++tb) {
+        if (tb < a.T) {
+          const uint4 xv = *reinterpret_cast<const uint4*>(
+              a.x + (int64_t)tb * a.x_t + 8 * i);
+          const half2* xh = reinterpret_cast<const half2*>(&xv);
+          float c = acc[tb];
+          c = __builtin_amdgcn_fdot2(wh[0], xh[0], c, false);
+          c = __builtin_amdgcn_fdot2(wh[1], xh[1], c, false);
+          c = __builtin_amdgcn_fdot2(wh[2], xh[2], c, false);
+          c = __builtin_amdgcn_fdot2(wh[3], xh[3], c, false);
+          acc[tb] = c;
+        }
+      }
+    }
+  }
+
+  wave_sum_n<TB>(acc);
+  if (lane == 0) {
+  #pragma unroll
+    for (int tb = 0; tb < TB; ++tb) s_part[wave][tb] = acc[tb];
+  }
+  __syncthreads();
+
+  if (wave == 0) {
+    if (lane < TB && lane < a.T) {
+      const float sum = (s_part[0][lane] + s_part[1][lane]) +
+                        (s_part[2][lane] + s_part[3][lane]);
+      a.logits[(int64_t)lane * E + e] = sum;
+    }
+    __threadfence();
+    if (lane == 0) {
+      const int old = atomicAdd(a.counters, 1);
+      s_flag = (old == E - 1);
+    }
+  }
+  __syncthreads();
+  if (!s_flag) return;
+  __threadfence();
+
+  // Last-arriver CTA: top-k per token (4 waves cover up to 8 tokens) + direct
+  // small-numel align
+  for (int t = wave; t < a.T; t += 4) route_topk_wave(a, t, s_flat_ids);
+  const int numel = a.T * a.K;
+  for (int p = tid; p < a.max_padded; p += kRouteSmallThreads)
+    a.sorted_ids[p] = numel;
+  __syncthreads();
+
+  const int BM = a.BM;
+  const int e0 = tid;
+  const int e1 = tid + kRouteSmallThreads;
+  int cnt0 = 0, cnt1 = 0;
+  for (int i = 0; i < numel; ++i) {
+    const int key = (int)s_flat_ids[i];
+    cnt0 += (key == e0) ? 1 : 0;
+    cnt1 += (key == e1) ? 1 : 0;
+  }
+  const int nb0 = (e0 < E) ? (cnt0 + BM - 1) / BM : 0;
+  const int nb1 = (e1 < E) ? (cnt1 + BM - 1) / BM : 0;
+  int v0 = nb0, v1 = nb1;
+  #pragma unroll
+  for (int d = 1; d < kWave; d <<= 1) {
+    const int n0 = __shfl_up(v0, d);
+    const int n1 = __shfl_up(v1, d);
+    if (lane >= d) {
+      v0 += n0;
+      v1 += n1;
+    }
+  }
+  if (lane == kWave - 1) {
+    s_ws[wave] = v0;
+    s_ws[4 + wave] = v1;
+  }
+  __syncthreads();
+  int base0 = 0, base1 = 0, total = 0;
+  #pragma unroll
+  for (int w = 0; w < 8; ++w) {
+    if (w < wave) base0 += s_ws[w];
+    if (w < 4 + wave) base1 += s_ws[w];
+    total += s_ws[w];
+  }
+  if (nb0 > 0) {
+    const int fb = base0 + v0 - nb0;
+    for (int b = 0; b < nb0; ++b) a.expert_ids[fb + b] = e0;
+    int pos = fb * BM;
+    for (int i = 0; i < numel; ++i) {
+      if ((int)s_flat_ids[i] == e0) a.sorted_ids[pos++] = i;
+    }
+  }
+  if (nb1 > 0) {
+    const int fb = base1 + v1 - nb1;
+    for (int b = 0; b < nb1; ++b) a.expert_ids[fb + b] = e1;
+    int pos = fb * BM;
+    for (int i = 0; i < numel; ++i) {
+      if ((int)s_flat_ids[i] == e1) a.sorted_ids[pos++] = i;
+    }
+  }
+  for (int b = total + tid; b < a.max_blocks; b += kRouteSmallThreads)
+    a.expert_ids[b] = -1;
+  if (tid == 0) {
+    a.post_pad[0] = total * BM;
+    a.counters[0] = 0;
+  }
+}
+
 #endif  // __HIP__RDNA2__ || !__HIP_DEVICE_COMPILE__
 
 template <typename WT, int TB>
@@ -1403,6 +2141,297 @@ __global__ void __launch_bounds__(kRouteThreads)
     moe_route_kernel(const RouteArgs a) {
 #if defined(__HIP__RDNA2__) || !defined(__HIP_DEVICE_COMPILE__)
   moe_route_body<WT, TB>(a);
+#endif
+}
+
+template <typename WT, int TB>
+__global__ void __launch_bounds__(kRouteSmallThreads)
+    moe_route_small_kernel(const RouteArgs a) {
+#if defined(__HIP__RDNA2__) || !defined(__HIP_DEVICE_COMPILE__)
+  moe_route_small_body<WT, TB>(a);
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// LoopCD (arXiv:2610.02185): hidden-state blend, gated readout, metadata prep,
+// and 2-pass contrastive logits
+// ---------------------------------------------------------------------------
+struct LoopcdBlendArgs {
+  float* x0;
+  int64_t x0_t;
+  float* x1;
+  int64_t x1_t;
+  const float* px0;
+  int64_t px0_t;
+  const float* px1;
+  int64_t px1_t;
+  float* blk;
+  int64_t b_t, b_p;
+  const float* pblk;
+  int64_t pb_t, pb_p;
+  const float* omega;
+  const float* omega_blk;
+  int P, H;
+};
+
+template <int DUMMY = 0>
+__global__ void __launch_bounds__(256)
+    loopcd_blend_kernel(const LoopcdBlendArgs a) {
+#if defined(__HIP__RDNA2__) || !defined(__HIP_DEVICE_COMPILE__)
+  const int64_t t = blockIdx.x;
+  const int slot = blockIdx.y;
+  if (slot == 0) {
+    const float w = a.omega[t];
+    if (w == 0.0f) return;
+    for (int i = threadIdx.x; i < (a.H >> 2); i += 256) {
+      float4 hf = load4(a.x0 + t * a.x0_t + 4 * i);
+      if (a.x1 != nullptr) {
+        const float4 qf = load4(a.x1 + t * a.x1_t + 4 * i);
+        hf = make_float4(hf.x + qf.x, hf.y + qf.y, hf.z + qf.z, hf.w + qf.w);
+      }
+      float4 hp = load4(a.px0 + t * a.px0_t + 4 * i);
+      const float4 qp = load4(a.px1 + t * a.px1_t + 4 * i);
+      hp = make_float4(hp.x + qp.x, hp.y + qp.y, hp.z + qp.z, hp.w + qp.w);
+      const float4 out =
+          make_float4(fmaf(w, hf.x - hp.x, hf.x), fmaf(w, hf.y - hp.y, hf.y),
+                      fmaf(w, hf.z - hp.z, hf.z), fmaf(w, hf.w - hp.w, hf.w));
+      store4(a.x0 + t * a.x0_t + 4 * i, out);
+      if (a.x1 != nullptr) {
+        store4(a.x1 + t * a.x1_t + 4 * i, make_float4(0.f, 0.f, 0.f, 0.f));
+      }
+    }
+  } else {
+    const int p = slot - 1;
+    if (p < 0 || p >= a.P) return;
+    const float wb = (a.omega_blk != nullptr) ? a.omega_blk[t] : a.omega[t];
+    if (wb == 0.0f) return;
+    for (int i = threadIdx.x; i < (a.H >> 2); i += 256) {
+      const float4 bf = load4(a.blk + t * a.b_t + (int64_t)p * a.b_p + 4 * i);
+      const float4 bp =
+          load4(a.pblk + t * a.pb_t + (int64_t)p * a.pb_p + 4 * i);
+      store4(a.blk + t * a.b_t + (int64_t)p * a.b_p + 4 * i,
+             make_float4(
+                 fmaf(wb, bf.x - bp.x, bf.x), fmaf(wb, bf.y - bp.y, bf.y),
+                 fmaf(wb, bf.z - bp.z, bf.z), fmaf(wb, bf.w - bp.w, bf.w)));
+    }
+  }
+#endif
+}
+
+template <int ITER>
+__global__ void __launch_bounds__(256)
+    loopcd_readout_kernel(const AttnResArgs a, const int32_t* gate) {
+#if defined(__HIP__RDNA2__) || !defined(__HIP_DEVICE_COMPILE__)
+  if (gate != nullptr && gate[0] == 0) return;
+  attn_res_body<1, ITER, true>(a);
+#endif
+}
+
+struct LoopcdPrepHiddenArgs {
+  float* omega_out;
+  float* omega_blk_out;
+  const void* idx;
+  const int32_t* qsl;
+  const int32_t* seq_lens;
+  const int32_t* prefill_len;
+  const float* req_alpha;
+  const int32_t* req_mode;
+  const int32_t* req_blend_blk;
+  int num_reqs;
+  int max_reqs;
+  int num_tokens_padded;
+  int ids_i64;
+};
+
+template <int DUMMY = 0>
+__global__ void __launch_bounds__(256)
+    loopcd_prepare_hidden_kernel(const LoopcdPrepHiddenArgs a) {
+#if defined(__HIP__RDNA2__) || !defined(__HIP_DEVICE_COMPILE__)
+  const int r = blockIdx.x;
+  if (r < a.num_reqs) {
+    const int qs = a.qsl[r];
+    const int qe = a.qsl[r + 1];
+    const int qlen = qe - qs;
+    const int64_t s = a.ids_i64
+                          ? reinterpret_cast<const int64_t*>(a.idx)[r]
+                          : (int64_t)reinterpret_cast<const int32_t*>(a.idx)[r];
+    if (s < 0 || s >= a.max_reqs) {
+      for (int k = threadIdx.x; k < qlen; k += 256) {
+        const int t = qs + k;
+        if (t >= 0 && t < a.num_tokens_padded) {
+          a.omega_out[t] = 0.0f;
+          a.omega_blk_out[t] = 0.0f;
+        }
+      }
+      return;
+    }
+    const int slen = a.seq_lens[r];
+    const int plen = a.prefill_len[s];
+    const float alpha = (a.req_mode[s] == 1) ? a.req_alpha[s] : 0.0f;
+    const bool bflag = a.req_blend_blk[s] != 0;
+    for (int k = threadIdx.x; k < qlen; k += 256) {
+      const int t = qs + k;
+      if (t >= 0 && t < a.num_tokens_padded) {
+        const int pos = (slen - qlen) + k;
+        const float w = (pos < plen - 1) ? 0.0f : alpha;
+        a.omega_out[t] = w;
+        a.omega_blk_out[t] = bflag ? w : 0.0f;
+      }
+    }
+  } else {
+    int end = (a.num_reqs > 0) ? a.qsl[a.num_reqs] : 0;
+    if (end < 0) end = 0;
+    for (int t = end + (int)threadIdx.x; t < a.num_tokens_padded; t += 256) {
+      a.omega_out[t] = 0.0f;
+      a.omega_blk_out[t] = 0.0f;
+    }
+  }
+#endif
+}
+
+struct LoopcdLogitsArgs {
+  float* zf;
+  int64_t zf_s;
+  const float* zw;
+  int64_t zw_s;
+  const float* omega;
+  const float* log_beta;
+  const void* adap;
+  float* stats;
+  int V, S;
+  int adap_bool;
+};
+
+template <int DUMMY = 0>
+__global__ void __launch_bounds__(256)
+    loopcd_logits_stats_kernel(const LoopcdLogitsArgs a) {
+#if defined(__HIP__RDNA2__) || !defined(__HIP_DEVICE_COMPILE__)
+  const int s = blockIdx.x;
+  const int64_t b = blockIdx.y;
+  if (a.omega[b] == 0.0f) return;
+
+  __shared__ float s_m[8];
+  __shared__ float s_l[8];
+
+  const int tid = threadIdx.x;
+  const int lane = tid & (kWave - 1);
+  const int wave = tid / kWave;
+  const float* zf_row = a.zf + b * a.zf_s;
+  const bool aligned = (reinterpret_cast<uintptr_t>(zf_row) & 15u) == 0u;
+
+  float m_loc = -INFINITY;
+  float l_loc = 0.0f;
+  auto upd = [&](float x) {
+    if (x > m_loc) {
+      l_loc = (m_loc > -INFINITY ? l_loc * expf(m_loc - x) : 0.0f) + 1.0f;
+      m_loc = x;
+    } else if (x > -INFINITY) {
+      l_loc += expf(x - m_loc);
+    }
+  };
+
+  if (aligned) {
+    const int V4 = a.V >> 2;
+    for (int v4 = s * 256 + tid; v4 < V4; v4 += a.S * 256) {
+      const float4 q = load4(zf_row + 4 * v4);
+      upd(q.x);
+      upd(q.y);
+      upd(q.z);
+      upd(q.w);
+    }
+    if (s == 0 && tid < (a.V & 3)) {
+      upd(zf_row[(a.V & ~3) + tid]);
+    }
+  } else {
+    for (int v = s * 256 + tid; v < a.V; v += a.S * 256) {
+      upd(zf_row[v]);
+    }
+  }
+
+  const float m_w = wave_max(m_loc);
+  const float l_w = wave_sum((m_loc > -INFINITY && m_w > -INFINITY)
+                                 ? l_loc * expf(m_loc - m_w)
+                                 : 0.0f);
+  if (lane == 0) {
+    s_m[wave] = m_w;
+    s_l[wave] = l_w;
+  }
+  __syncthreads();
+
+  if (wave == 0) {
+    const float mw = (lane < 8) ? s_m[lane] : -INFINITY;
+    const float lw = (lane < 8) ? s_l[lane] : 0.0f;
+    const float m_cta = wave_max(mw);
+    const float l_cta = wave_sum(
+        (mw > -INFINITY && m_cta > -INFINITY) ? lw * expf(mw - m_cta) : 0.0f);
+    if (lane == 0) {
+      float* dst = a.stats + (b * 32 + s) * 2;
+      dst[0] = m_cta;
+      dst[1] = l_cta;
+    }
+  }
+#endif
+}
+
+template <int DUMMY = 0>
+__global__ void __launch_bounds__(256)
+    loopcd_logits_apply_kernel(const LoopcdLogitsArgs a) {
+#if defined(__HIP__RDNA2__) || !defined(__HIP_DEVICE_COMPILE__)
+  const int s = blockIdx.x;
+  const int64_t b = blockIdx.y;
+  const float w0 = a.omega[b];
+  if (w0 == 0.0f) return;
+
+  const int tid = threadIdx.x;
+  const int lane = tid & (kWave - 1);
+  float ms = -INFINITY;
+  float ls = 0.0f;
+  if (lane < a.S) {
+    const float* st = a.stats + (b * 32 + lane) * 2;
+    ms = st[0];
+    ls = st[1];
+  }
+  const float m_b = wave_max(ms);
+  if (!(m_b > -INFINITY)) return;
+  const float denom = wave_sum((ms > -INFINITY) ? ls * expf(ms - m_b) : 0.0f);
+
+  const bool adap = a.adap_bool
+                        ? reinterpret_cast<const bool*>(a.adap)[b]
+                        : (reinterpret_cast<const int32_t*>(a.adap)[b] != 0);
+  const float p_max = (denom > 0.0f) ? (1.0f / denom) : 1.0f;
+  const float wb = adap ? (w0 * fmaxf(0.0f, 1.0f - p_max)) : w0;
+  const float cutoff = m_b + a.log_beta[b];
+
+  float* zf_row = a.zf + b * a.zf_s;
+  const float* zw_row = a.zw + b * a.zw_s;
+  const bool aligned = ((reinterpret_cast<uintptr_t>(zf_row) |
+                         reinterpret_cast<uintptr_t>(zw_row)) &
+                        15u) == 0u;
+
+  auto apply1 = [&](float zf, float zw) -> float {
+    return (zf >= cutoff && zf > -INFINITY)
+               ? ((isfinite(zf) && isfinite(zw)) ? fmaf(wb, zf - zw, zf) : zf)
+               : -INFINITY;
+  };
+
+  if (aligned) {
+    const int V4 = a.V >> 2;
+    for (int v4 = s * 256 + tid; v4 < V4; v4 += a.S * 256) {
+      const float4 qf = load4(zf_row + 4 * v4);
+      const float4 qw = load4(zw_row + 4 * v4);
+      store4(zf_row + 4 * v4,
+             make_float4(apply1(qf.x, qw.x), apply1(qf.y, qw.y),
+                         apply1(qf.z, qw.z), apply1(qf.w, qw.w)));
+    }
+    if (s == 0 && tid < (a.V & 3)) {
+      const int v = (a.V & ~3) + tid;
+      zf_row[v] = apply1(zf_row[v], zw_row[v]);
+    }
+  } else {
+    for (int v = s * 256 + tid; v < a.V; v += a.S * 256) {
+      zf_row[v] = apply1(zf_row[v], zw_row[v]);
+    }
+  }
 #endif
 }
 
@@ -1480,8 +2509,16 @@ bool fuse_glue() {
 }  // namespace
 
 // ---------------------------------------------------------------------------
-// inkling2_glue_attn_res
+// inkling2_glue_attn_res / _dual / _sconv
 // ---------------------------------------------------------------------------
+static int glue_log2_exact(int64_t v, const char* who) {
+  TORCH_CHECK(v >= 1 && (v & (v - 1)) == 0, who,
+              ": the cache block size must be a power of two, got ", v);
+  int s = 0;
+  while ((int64_t(1) << s) < v) ++s;
+  return s;
+}
+
 template <int Q, bool NORM>
 static void launch_attn_res(int iter, int block, int64_t T,
                             const AttnResArgs& a, hipStream_t stream) {
@@ -1502,41 +2539,51 @@ static void launch_attn_res(int iter, int block, int64_t T,
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-void inkling2_glue_attn_res(const at::Tensor& blocks, int64_t n_blocks,
-                            const at::Tensor& x0,
-                            const std::optional<at::Tensor>& x1,
-                            const std::optional<at::Tensor>& partial_out,
-                            const std::optional<at::Tensor>& append,
-                            const at::Tensor& query,
-                            const std::optional<at::Tensor>& norm_w,
-                            const at::Tensor& out, double eps,
-                            double norm_eps) {
-  const char* who = "inkling2_glue_attn_res";
-  check_gpu(x0, who, "x0");
+template <int Q, bool NORM, int SCONV_MODE>
+static void launch_attn_res_sconv(int iter, int block, int64_t T,
+                                  const AttnResSconvArgs& sa,
+                                  hipStream_t stream) {
+#define I2G_ARS(IT)                                               \
+  case IT:                                                        \
+    inkling2_glue::attn_res_sconv_kernel<Q, IT, NORM, SCONV_MODE> \
+        <<<dim3((unsigned)T), dim3(block), 0, stream>>>(sa);      \
+    break
+  switch (iter) {
+    I2G_ARS(1);
+    I2G_ARS(2);
+    I2G_ARS(3);
+    I2G_ARS(4);
+    default:
+      TORCH_CHECK(false, "inkling2_glue_attn_res_sconv: bad iter ", iter);
+  }
+#undef I2G_ARS
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+static void fill_attn_res_common(AttnResArgs& a, const char* who,
+                                 const at::Tensor& blocks, int64_t n_blocks,
+                                 int64_t T, int64_t H, int64_t Q,
+                                 const std::optional<at::Tensor>& partial_out,
+                                 const std::optional<at::Tensor>& append,
+                                 const at::Tensor& query,
+                                 const std::optional<at::Tensor>& norm_w,
+                                 const at::Tensor& out,
+                                 const std::optional<at::Tensor>& norm_out2,
+                                 double eps, double norm_eps, bool& norm) {
   check_gpu(query, who, "query");
   check_gpu(out, who, "out");
-  TORCH_CHECK(x0.dim() == 2, who, ": x0 must be [T, H]");
-  const int64_t T = x0.size(0), H = x0.size(1);
-  check_dtype(x0, who, "x0", at::kFloat);
-  check_vec_rows(x0, who, "x0", 4);
   check_dtype(query, who, "query", at::kFloat);
   TORCH_CHECK(query.dim() == 2 && query.size(1) == H, who,
               ": query must be [Q, H]");
   check_vec_rows(query, who, "query", 4);
-  const int64_t Q = query.size(0);
-  TORCH_CHECK(Q == 1 || Q == 3 || Q == 4, who, ": Q must be 1, 3 or 4, got ",
-              Q);
   TORCH_CHECK(out.dim() == 3 && out.size(0) == T && out.size(1) == Q &&
                   out.size(2) == H,
               who, ": out must be [T, Q, H]");
-  const bool norm = norm_w.has_value() && norm_w->defined();
+  norm = norm_w.has_value() && norm_w->defined();
   check_dtype(out, who, "out", norm ? at::kHalf : at::kFloat);
   check_vec_rows(out, who, "out", 4);
   TORCH_CHECK(n_blocks >= 0, who, ": n_blocks must be >= 0");
 
-  AttnResArgs a{};
-  a.x0 = x0.data_ptr<float>();
-  a.x0_t = x0.stride(0);
   a.query = query.data_ptr<float>();
   a.q_s = query.stride(0);
   a.out = out.data_ptr();
@@ -1549,15 +2596,6 @@ void inkling2_glue_attn_res(const at::Tensor& blocks, int64_t n_blocks,
   a.inv_h = 1.0f / (float)H;
   a.scale = (float)std::pow((double)H, -0.5);
 
-  if (x1.has_value() && x1->defined()) {
-    check_gpu(*x1, who, "x1");
-    check_dtype(*x1, who, "x1", at::kFloat);
-    TORCH_CHECK(x1->dim() == 2 && x1->size(0) == T && x1->size(1) == H, who,
-                ": x1 must be [T, H]");
-    check_vec_rows(*x1, who, "x1", 4);
-    a.x1 = x1->data_ptr<float>();
-    a.x1_t = x1->stride(0);
-  }
   if (partial_out.has_value() && partial_out->defined()) {
     check_gpu(*partial_out, who, "partial_out");
     check_dtype(*partial_out, who, "partial_out", at::kFloat);
@@ -1605,6 +2643,54 @@ void inkling2_glue_attn_res(const at::Tensor& blocks, int64_t n_blocks,
     a.nw_s = norm_w->stride(0);
     a.nw_rows = (int)norm_w->size(0);
   }
+  if (norm_out2.has_value() && norm_out2->defined()) {
+    TORCH_CHECK(norm && Q == 1, who, ": norm_out2 requires norm_w and Q == 1");
+    check_gpu(*norm_out2, who, "norm_out2");
+    TORCH_CHECK(norm_out2->scalar_type() == at::kFloat ||
+                    norm_out2->scalar_type() == at::kBFloat16,
+                who, ": norm_out2 must be Float or BFloat16");
+    TORCH_CHECK(norm_out2->dim() == 2 && norm_out2->size(0) == T &&
+                    norm_out2->size(1) == H,
+                who, ": norm_out2 must be [T, H]");
+    check_vec_rows(*norm_out2, who, "norm_out2", 4);
+    a.norm_out2 = norm_out2->data_ptr();
+    a.no2_t = norm_out2->stride(0);
+    a.no2_bf16 = norm_out2->scalar_type() == at::kBFloat16 ? 1 : 0;
+  }
+}
+
+void inkling2_glue_attn_res_dual(
+    const at::Tensor& blocks, int64_t n_blocks, const at::Tensor& x0,
+    const std::optional<at::Tensor>& x1,
+    const std::optional<at::Tensor>& partial_out,
+    const std::optional<at::Tensor>& append, const at::Tensor& query,
+    const std::optional<at::Tensor>& norm_w, const at::Tensor& out,
+    const std::optional<at::Tensor>& norm_out2, double eps, double norm_eps) {
+  const char* who = "inkling2_glue_attn_res";
+  check_gpu(x0, who, "x0");
+  TORCH_CHECK(x0.dim() == 2, who, ": x0 must be [T, H]");
+  const int64_t T = x0.size(0), H = x0.size(1);
+  check_dtype(x0, who, "x0", at::kFloat);
+  check_vec_rows(x0, who, "x0", 4);
+  const int64_t Q = query.dim() == 2 ? query.size(0) : -1;
+  TORCH_CHECK(Q == 1 || Q == 3 || Q == 4, who, ": Q must be 1, 3 or 4, got ",
+              Q);
+
+  AttnResArgs a{};
+  bool norm = false;
+  fill_attn_res_common(a, who, blocks, n_blocks, T, H, Q, partial_out, append,
+                       query, norm_w, out, norm_out2, eps, norm_eps, norm);
+  a.x0 = x0.data_ptr<float>();
+  a.x0_t = x0.stride(0);
+  if (x1.has_value() && x1->defined()) {
+    check_gpu(*x1, who, "x1");
+    check_dtype(*x1, who, "x1", at::kFloat);
+    TORCH_CHECK(x1->dim() == 2 && x1->size(0) == T && x1->size(1) == H, who,
+                ": x1 must be [T, H]");
+    check_vec_rows(*x1, who, "x1", 4);
+    a.x1 = x1->data_ptr<float>();
+    a.x1_t = x1->stride(0);
+  }
 
   const at::cuda::OptionalCUDAGuard guard(device_of(x0));
   const hipStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -1626,6 +2712,151 @@ void inkling2_glue_attn_res(const at::Tensor& blocks, int64_t n_blocks,
       break;
   }
 #undef I2G_ARQ
+}
+
+void inkling2_glue_attn_res(const at::Tensor& blocks, int64_t n_blocks,
+                            const at::Tensor& x0,
+                            const std::optional<at::Tensor>& x1,
+                            const std::optional<at::Tensor>& partial_out,
+                            const std::optional<at::Tensor>& append,
+                            const at::Tensor& query,
+                            const std::optional<at::Tensor>& norm_w,
+                            const at::Tensor& out, double eps,
+                            double norm_eps) {
+  inkling2_glue_attn_res_dual(blocks, n_blocks, x0, x1, partial_out, append,
+                              query, norm_w, out, std::nullopt, eps, norm_eps);
+}
+
+void inkling2_glue_attn_res_sconv(
+    const at::Tensor& blocks, int64_t n_blocks,
+    const std::optional<at::Tensor>& x0, const at::Tensor& conv_x,
+    const at::Tensor& conv_w, const at::Tensor& conv_cache,
+    const at::Tensor& block_table, const at::Tensor& seq_idx,
+    const at::Tensor& query_start_loc, const at::Tensor& seq_lens,
+    int64_t stream_offset, int64_t num_kv_heads, int64_t block_size,
+    bool write_state, const std::optional<at::Tensor>& sconv_out,
+    const std::optional<at::Tensor>& partial_out,
+    const std::optional<at::Tensor>& append, const at::Tensor& query,
+    const std::optional<at::Tensor>& norm_w, const at::Tensor& out,
+    const std::optional<at::Tensor>& norm_out2, double eps, double norm_eps) {
+  const char* who = "inkling2_glue_attn_res_sconv";
+  check_gpu(conv_x, who, "conv_x");
+  check_dtype(conv_x, who, "conv_x", at::kHalf);
+  TORCH_CHECK(conv_x.dim() == 2, who, ": conv_x must be [T, H]");
+  const int64_t T = conv_x.size(0), H = conv_x.size(1);
+  check_vec_rows(conv_x, who, "conv_x", 4);
+  const bool has_x0 = x0.has_value() && x0->defined();
+  const int64_t Q = query.dim() == 2 ? query.size(0) : -1;
+  TORCH_CHECK(Q == 1 || (Q == 3 && has_x0), who,
+              ": Q must be 1 (or 3 with x0), got ", Q);
+
+  AttnResSconvArgs sa{};
+  bool norm = false;
+  fill_attn_res_common(sa.base, who, blocks, n_blocks, T, H, Q, partial_out,
+                       append, query, norm_w, out, norm_out2, eps, norm_eps,
+                       norm);
+  if (has_x0) {
+    check_gpu(*x0, who, "x0");
+    check_dtype(*x0, who, "x0", at::kFloat);
+    TORCH_CHECK(x0->dim() == 2 && x0->size(0) == T && x0->size(1) == H, who,
+                ": x0 must be [T, H]");
+    check_vec_rows(*x0, who, "x0", 4);
+    sa.base.x0 = x0->data_ptr<float>();
+    sa.base.x0_t = x0->stride(0);
+  }
+  if (sconv_out.has_value() && sconv_out->defined()) {
+    check_gpu(*sconv_out, who, "sconv_out");
+    check_dtype(*sconv_out, who, "sconv_out", at::kFloat);
+    TORCH_CHECK(sconv_out->dim() == 2 && sconv_out->size(0) == T &&
+                    sconv_out->size(1) == H,
+                who, ": sconv_out must be [T, H]");
+    check_vec_rows(*sconv_out, who, "sconv_out", 4);
+    sa.sconv_out = sconv_out->data_ptr<float>();
+    sa.sco_t = sconv_out->stride(0);
+  }
+
+  check_gpu(conv_cache, who, "conv_cache");
+  TORCH_CHECK(conv_cache.scalar_type() == at::kHalf && conv_cache.dim() == 4 &&
+                  conv_cache.stride(3) == 1,
+              who, ": conv_cache must be fp16 [blocks, H, ring_rows, W]");
+  TORCH_CHECK(conv_cache.size(2) >= 3, who,
+              ": the conv state keeps at least k - 1 = 3 ring rows per block");
+  for (const auto& p :
+       std::initializer_list<std::pair<const at::Tensor*, const char*>>{
+           {&block_table, "block_table"},
+           {&seq_idx, "seq_idx"},
+           {&query_start_loc, "query_start_loc"},
+           {&seq_lens, "seq_lens"}}) {
+    check_gpu(*p.first, who, p.second);
+    check_dtype(*p.first, who, p.second, at::kInt);
+    TORCH_CHECK(p.first->is_contiguous(), who, ": ", p.second,
+                " must be contiguous");
+  }
+  TORCH_CHECK(block_table.dim() == 2, who, ": block_table must be [R, blocks]");
+  TORCH_CHECK(conv_cache.stride(0) % 4 == 0 && conv_cache.stride(1) % 4 == 0 &&
+                  conv_cache.stride(2) % 4 == 0 &&
+                  (reinterpret_cast<uintptr_t>(conv_cache.data_ptr()) & 7) == 0,
+              who, ": conv_cache must be 8-byte aligned");
+  TORCH_CHECK(num_kv_heads > 0 && H % num_kv_heads == 0, who,
+              ": channels must be divisible by num_kv_heads");
+  const int64_t width = H / num_kv_heads;
+  TORCH_CHECK(width % 4 == 0 && stream_offset % 4 == 0, who,
+              ": stream width and offset must be multiples of 4");
+  TORCH_CHECK(conv_cache.size(1) == num_kv_heads &&
+                  stream_offset + width <= conv_cache.size(3),
+              who, ": conv_cache heads / width do not hold this stream");
+  check_gpu(conv_w, who, "conv_w");
+  TORCH_CHECK(conv_w.scalar_type() == at::kFloat && conv_w.is_contiguous() &&
+                  conv_w.numel() == 4 * H &&
+                  (reinterpret_cast<uintptr_t>(conv_w.data_ptr()) & 15) == 0,
+              who, ": conv_w must be a contiguous fp32 [H, 1, 4] tensor");
+
+  sa.cm.block_table = block_table.data_ptr<int32_t>();
+  sa.cm.seq_idx = seq_idx.data_ptr<int32_t>();
+  sa.cm.qsl = query_start_loc.data_ptr<int32_t>();
+  sa.cm.seq_lens = seq_lens.data_ptr<int32_t>();
+  sa.cm.cache = reinterpret_cast<__half*>(conv_cache.data_ptr());
+  sa.cm.cs0 = conv_cache.stride(0);
+  sa.cm.cs1 = conv_cache.stride(1);
+  sa.cm.cs2 = conv_cache.stride(2);
+  sa.cm.bt_stride = (int)block_table.stride(0);
+  sa.cm.blk_shift = glue_log2_exact(block_size, who);
+  sa.cm.ring = (int)conv_cache.size(2);
+  sa.cm.T_md = (int)std::min<int64_t>(seq_idx.size(0), T);
+  sa.cx = reinterpret_cast<const __half*>(conv_x.data_ptr());
+  sa.cx_t = conv_x.stride(0);
+  sa.cw = conv_w.data_ptr<float>();
+  sa.conv_width = (int)width;
+  sa.conv_o0 = (int)stream_offset;
+  sa.conv_wr = write_state ? 1 : 0;
+  sa.conv_inv = (float)(1.0 / std::sqrt(5.0));
+
+  const at::cuda::OptionalCUDAGuard guard(device_of(conv_x));
+  const hipStream_t stream = at::cuda::getCurrentCUDAStream();
+  if (T == 0) return;
+  int iter, block;
+  row_launch_shape(H, who, iter, block);
+#define I2G_SC(QQ, NN, SM) \
+  launch_attn_res_sconv<QQ, NN, SM>(iter, block, T, sa, stream)
+  if (has_x0) {
+    if (Q == 1) {
+      if (norm)
+        I2G_SC(1, true, 1);
+      else
+        I2G_SC(1, false, 1);
+    } else {
+      if (norm)
+        I2G_SC(3, true, 1);
+      else
+        I2G_SC(3, false, 1);
+    }
+  } else {
+    if (norm)
+      I2G_SC(1, true, 2);
+    else
+      I2G_SC(1, false, 2);
+  }
+#undef I2G_SC
 }
 
 // ---------------------------------------------------------------------------
@@ -1845,7 +3076,7 @@ void inkling2_glue_msg_gate_mix(const at::Tensor& h, const at::Tensor& m,
   a.inv_h = 1.0f / (float)H;
 
   // a handful of tokens with fp32 weights: the R-split kernel (opt-in)
-  const bool split = fuse_glue() && !w16 && T <= 4 && R == kMixWaves * kMixRpw;
+  const bool split = fuse_glue() && !w16 && T <= 16 && R == kMixWaves * kMixRpw;
   const int tb = split ? gate_tb(T, 4) : gate_mix_tb(T, G * a.C, w16 ? 16 : 8);
   const int64_t ntiles = (T + tb - 1) / tb;
   if (norm) {
@@ -1906,6 +3137,151 @@ void inkling2_glue_msg_gate_mix(const at::Tensor& h, const at::Tensor& m,
     else
       launch_gate_mix<float, false>(tb, grid, block, a, stream);
   }
+}
+
+static int device_cu_count(int dev) {
+  static int cache[64] = {};
+  if (dev >= 0 && dev < 64 && cache[dev] > 0) return cache[dev];
+  int mp = 0;
+  if (hipDeviceGetAttribute(&mp, hipDeviceAttributeMultiprocessorCount, dev) !=
+      hipSuccess) {
+    mp = 0;
+  }
+  if (dev >= 0 && dev < 64 && mp > 0) cache[dev] = mp;
+  return mp;
+}
+
+void inkling2_glue_msg_gate_down_mix(const at::Tensor& h, const at::Tensor& m,
+                                     const at::Tensor& wd, const at::Tensor& d,
+                                     const at::Tensor& wf, const at::Tensor& wg,
+                                     const std::optional<at::Tensor>& norm_w,
+                                     const at::Tensor& out,
+                                     const std::optional<at::Tensor>& scratch,
+                                     const std::optional<at::Tensor>& partials,
+                                     const std::optional<at::Tensor>& counters,
+                                     double eps, double norm_eps) {
+  const char* who = "inkling2_glue_msg_gate_down_mix";
+  const bool w16 = wf.scalar_type() == at::kHalf;
+  const bool norm = out.scalar_type() == at::kHalf;
+  const int64_t T = m.dim() == 3 ? m.size(0) : 0;
+  const int64_t G = m.dim() == 3 ? m.size(1) : 0;
+  const int64_t H = m.dim() == 3 ? m.size(2) : 0;
+  const int64_t R = d.dim() == 3 ? d.size(2) : 0;
+  const int64_t C = (H + 127) / 128;
+  const int tb = gate_tb(T, 4);
+  const int64_t ntiles = T > 0 ? (T + tb - 1) / tb : 0;
+  const int dev = m.is_cuda() ? (int)m.get_device() : -1;
+  const int sm_count = dev >= 0 ? device_cu_count(dev) : 0;
+  const bool can_fuse =
+      fuse_glue() && !w16 && norm && T > 0 && T <= 16 &&
+      R == kMixWaves * kMixRpw && C >= 8 && H <= 4096 && H % 8 == 0 &&
+      sm_count > 0 && (C * G * ntiles) <= sm_count && norm_w.has_value() &&
+      norm_w->defined() && scratch.has_value() && scratch->defined() &&
+      partials.has_value() && partials->defined() && counters.has_value() &&
+      counters->defined() && counters->numel() >= 2 * G * ntiles;
+  if (!can_fuse) {
+    inkling2_glue_msg_gate_down(h, m, wd, d, eps);
+    inkling2_glue_msg_gate_mix(h, m, d, wf, wg, norm_w, out, scratch, partials,
+                               counters, norm_eps);
+    return;
+  }
+
+  check_gpu(h, who, "h");
+  check_gpu(m, who, "m");
+  check_gpu(wd, who, "wd");
+  check_gpu(d, who, "d");
+  check_gpu(wf, who, "wf");
+  check_gpu(wg, who, "wg");
+  check_gpu(*norm_w, who, "norm_w");
+  check_gpu(out, who, "out");
+  check_dtype(h, who, "h", at::kFloat);
+  check_dtype(m, who, "m", at::kFloat);
+  check_dtype(wd, who, "wd", at::kHalf);
+  check_dtype(d, who, "d", at::kHalf);
+  check_dtype(wf, who, "wf", at::kFloat);
+  check_dtype(wg, who, "wg", at::kFloat);
+  TORCH_CHECK(h.dim() == 3 && h.size(0) == T && h.size(2) == H &&
+                  (h.size(1) == G || h.size(1) == 1),
+              who, ": h must be [T, G or 1, H]");
+  check_vec_rows(h, who, "h", 4);
+  check_vec_rows(m, who, "m", 4);
+  TORCH_CHECK(wd.dim() == 3 && wd.size(0) == G && wd.size(1) == R &&
+                  wd.size(2) == 2 * H && wd.is_contiguous(),
+              who, ": wd must be contiguous [G, R, 2H]");
+  TORCH_CHECK(d.dim() == 3 && d.size(0) == G && d.size(1) == T &&
+                  d.size(2) == R && d.is_contiguous(),
+              who, ": d must be contiguous [G, T, R]");
+  TORCH_CHECK(wf.dim() == 3 && wf.size(0) == G && wf.size(1) == R &&
+                  wf.size(2) == H && wf.is_contiguous() &&
+                  wg.sizes() == wf.sizes() && wg.is_contiguous(),
+              who, ": fp32 wf / wg must be contiguous [G, R, H]");
+  TORCH_CHECK(out.dim() == 3 && out.size(0) == G && out.size(1) == T &&
+                  out.size(2) == H && out.is_contiguous(),
+              who, ": out must be contiguous [G, T, H]");
+  TORCH_CHECK(norm_w->dim() == 2 && norm_w->size(1) == H &&
+                  (norm_w->size(0) == 1 || norm_w->size(0) == G),
+              who, ": norm_w must be [1 or G, H]");
+  check_vec_rows(*norm_w, who, "norm_w", 4);
+  TORCH_CHECK(scratch->scalar_type() == at::kFloat &&
+                  scratch->is_contiguous() && scratch->numel() >= G * T * H,
+              who, ": scratch must be fp32 with >= G*T*H elements");
+  TORCH_CHECK(partials->scalar_type() == at::kFloat &&
+                  partials->is_contiguous() && partials->numel() >= G * T * C,
+              who, ": partials must be fp32 with >= G*T*C elements");
+  TORCH_CHECK(counters->scalar_type() == at::kInt &&
+                  counters->is_contiguous() &&
+                  counters->numel() >= 2 * G * ntiles,
+              who, ": counters must be int32 with >= 2*G*ntiles elements");
+
+  GateFusedArgs a{};
+  a.h = h.data_ptr<float>();
+  a.h_t = h.stride(0);
+  a.h_s = h.size(1) == 1 ? 0 : h.stride(1);
+  a.m = m.data_ptr<float>();
+  a.m_t = m.stride(0);
+  a.m_s = m.stride(1);
+  a.wd = reinterpret_cast<const __half*>(wd.data_ptr());
+  a.d = reinterpret_cast<__half*>(d.data_ptr());
+  a.wf = wf.data_ptr<float>();
+  a.wg = wg.data_ptr<float>();
+  a.nw = norm_w->data_ptr();
+  a.nw_s = norm_w->stride(0);
+  a.nw_f16 = is_f16(*norm_w, who, "norm_w");
+  a.nw_rows = (int)norm_w->size(0);
+  a.out32 = scratch->data_ptr<float>();
+  a.out16 = reinterpret_cast<__half*>(out.data_ptr());
+  a.part = partials->data_ptr<float>();
+  a.counters = counters->data_ptr<int>();
+  a.T = (int)T;
+  a.R = (int)R;
+  a.H = (int)H;
+  a.C = (int)C;
+  a.eps = (float)eps;
+  a.norm_eps = (float)norm_eps;
+  a.inv_h = 1.0f / (float)H;
+
+  const at::cuda::OptionalCUDAGuard guard(device_of(m));
+  const hipStream_t stream = at::cuda::getCurrentCUDAStream();
+  const size_t smem_down = (size_t)tb * 2 * H * sizeof(__half);
+  const size_t smem_mix = (size_t)kMixWaves * tb * 2 * kWave * sizeof(float4);
+  const size_t shmem = std::max(smem_down, smem_mix);
+  const dim3 grid((unsigned)C, (unsigned)G, (unsigned)ntiles);
+  const dim3 block(kMixWaves * kWave);
+  switch (tb) {
+    case 1:
+      inkling2_glue::gate_down_mix_fused_kernel<1, kMixRpw, true>
+          <<<grid, block, shmem, stream>>>(a);
+      break;
+    case 2:
+      inkling2_glue::gate_down_mix_fused_kernel<2, kMixRpw, true>
+          <<<grid, block, shmem, stream>>>(a);
+      break;
+    default:
+      inkling2_glue::gate_down_mix_fused_kernel<4, kMixRpw, true>
+          <<<grid, block, shmem, stream>>>(a);
+      break;
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 // ---------------------------------------------------------------------------
@@ -2125,7 +3501,8 @@ void inkling2_glue_copy_states(const at::Tensor& src, const at::Tensor& dst) {
   check_gpu(src, who, "src");
   check_gpu(dst, who, "dst");
   check_dtype(src, who, "src", at::kFloat);
-  check_dtype(dst, who, "dst", at::kFloat);
+  const bool dst_bf16 = dst.scalar_type() == at::kBFloat16;
+  if (!dst_bf16) check_dtype(dst, who, "dst", at::kFloat);
   TORCH_CHECK((src.dim() == 2 || src.dim() == 3) && dst.sizes() == src.sizes(),
               who, ": src and dst must be [T, H] or [T, P, H] of one shape");
   check_vec_rows(src, who, "src", 4);
@@ -2136,7 +3513,7 @@ void inkling2_glue_copy_states(const at::Tensor& src, const at::Tensor& dst) {
   const int64_t P = src.dim() == 3 ? src.size(1) : 1;
   CopyArgs a{};
   a.src = src.data_ptr<float>();
-  a.dst = dst.data_ptr<float>();
+  a.dst = dst.data_ptr();
   a.s_t = src.stride(0);
   a.d_t = dst.stride(0);
   a.s_p = src.dim() == 3 ? src.stride(1) : 0;
@@ -2146,14 +3523,39 @@ void inkling2_glue_copy_states(const at::Tensor& src, const at::Tensor& dst) {
   const at::cuda::OptionalCUDAGuard guard(device_of(src));
   const hipStream_t stream = at::cuda::getCurrentCUDAStream();
   if (T * P == 0) return;
-  inkling2_glue::copy_states_kernel<0>
-      <<<dim3((unsigned)(T * P)), dim3(256), 0, stream>>>(a);
+  if (dst_bf16) {
+    inkling2_glue::copy_states_kernel<true>
+        <<<dim3((unsigned)(T * P)), dim3(256), 0, stream>>>(a);
+  } else {
+    inkling2_glue::copy_states_kernel<false>
+        <<<dim3((unsigned)(T * P)), dim3(256), 0, stream>>>(a);
+  }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 // ---------------------------------------------------------------------------
 // inkling2_glue_moe_route
 // ---------------------------------------------------------------------------
+template <typename WT>
+static void launch_route_small(int tb, unsigned grid, const RouteArgs& a,
+                               hipStream_t stream) {
+  switch (tb) {
+    case 1:
+      inkling2_glue::moe_route_small_kernel<WT, 1>
+          <<<dim3(grid), dim3(kRouteSmallThreads), 0, stream>>>(a);
+      break;
+    case 2:
+      inkling2_glue::moe_route_small_kernel<WT, 2>
+          <<<dim3(grid), dim3(kRouteSmallThreads), 0, stream>>>(a);
+      break;
+    default:
+      inkling2_glue::moe_route_small_kernel<WT, 4>
+          <<<dim3(grid), dim3(kRouteSmallThreads), 0, stream>>>(a);
+      break;
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 template <typename WT>
 static void launch_route(int tb, unsigned grid, size_t shmem,
                          const RouteArgs& a, hipStream_t stream) {
@@ -2293,6 +3695,31 @@ void inkling2_glue_moe_route(
     }
   }
 
+  const at::cuda::OptionalCUDAGuard guard(device_of(x));
+  const hipStream_t stream = at::cuda::getCurrentCUDAStream();
+  if (T == 0) return;
+
+  // Small-T path (decode and speculative verify steps): 1 expert per CTA,
+  // zero dynamic LDS, single global barrier, in-LDS align.  Capped at T <= 4:
+  // at T=5..8 per-CTA register pressure and the serial align loop make the
+  // 16-CTA path faster.
+  if (fuse_glue() && T <= 4) {
+    const int stb = T == 1 ? 1 : (T == 2 ? 2 : 4);
+    a.NT = 1;
+    a.NEG = (int)E;
+    TORCH_CHECK(counters.numel() >= a.NT + 1, who,
+                ": counters needs >= ", a.NT + 1, " int32 (zero on entry)");
+    a.nzero = (int)std::min<int64_t>(
+        (zero_bytes + 16 * kRouteSmallThreads - 1) / (16 * kRouteSmallThreads),
+        kMaxZeroCtas);
+    const unsigned sgrid = (unsigned)(a.nzero + E);
+    if (w16)
+      launch_route_small<__half>(stb, sgrid, a, stream);
+    else
+      launch_route_small<float>(stb, sgrid, a, stream);
+    return;
+  }
+
   // tokens per CTA tile: fp32 weights stage x as fp32 (LDS), fp16 as fp16
   const int xsz = w16 ? 2 : 4;
   int tb = 1;
@@ -2316,11 +3743,331 @@ void inkling2_glue_moe_route(
   const unsigned grid = (unsigned)(a.nzero + (int64_t)a.NT * a.NEG);
   const size_t shmem = std::max<size_t>((size_t)tb * H * xsz, kAlignSmemBytes);
 
-  const at::cuda::OptionalCUDAGuard guard(device_of(x));
-  const hipStream_t stream = at::cuda::getCurrentCUDAStream();
-  if (T == 0) return;
   if (w16)
     launch_route<__half>(tb, grid, shmem, a, stream);
   else
     launch_route<float>(tb, grid, shmem, a, stream);
+}
+
+// ---------------------------------------------------------------------------
+// inkling2_glue_loopcd_blend
+// ---------------------------------------------------------------------------
+void inkling2_glue_loopcd_blend(const torch::Tensor& x0,
+                                const std::optional<torch::Tensor>& x1,
+                                const torch::Tensor& prev_x0,
+                                const torch::Tensor& prev_x1,
+                                const std::optional<torch::Tensor>& blk,
+                                const std::optional<torch::Tensor>& prev_blk,
+                                const torch::Tensor& omega,
+                                const std::optional<torch::Tensor>& omega_blk) {
+  const char* who = "inkling2_glue_loopcd_blend";
+  check_gpu(x0, who, "x0");
+  check_gpu(prev_x0, who, "prev_x0");
+  check_gpu(prev_x1, who, "prev_x1");
+  check_gpu(omega, who, "omega");
+  check_dtype(x0, who, "x0", at::kFloat);
+  check_dtype(prev_x0, who, "prev_x0", at::kFloat);
+  check_dtype(prev_x1, who, "prev_x1", at::kFloat);
+  check_dtype(omega, who, "omega", at::kFloat);
+  TORCH_CHECK(x0.dim() == 2, who, ": x0 must be [T, H]");
+  const int64_t T = x0.size(0), H = x0.size(1);
+  TORCH_CHECK(H % 4 == 0, who, ": hidden size must be a multiple of 4");
+  TORCH_CHECK(
+      prev_x0.dim() == 2 && prev_x0.size(0) == T && prev_x0.size(1) == H, who,
+      ": prev_x0 must be [T, H]");
+  TORCH_CHECK(
+      prev_x1.dim() == 2 && prev_x1.size(0) == T && prev_x1.size(1) == H, who,
+      ": prev_x1 must be [T, H]");
+  check_vec_rows(x0, who, "x0", 4);
+  check_vec_rows(prev_x0, who, "prev_x0", 4);
+  check_vec_rows(prev_x1, who, "prev_x1", 4);
+  TORCH_CHECK(omega.dim() == 1 && omega.is_contiguous() && omega.numel() >= T,
+              who, ": omega must be 1-D contiguous with numel() >= T");
+
+  LoopcdBlendArgs a{};
+  a.x0 = x0.data_ptr<float>();
+  a.x0_t = x0.stride(0);
+  a.px0 = prev_x0.data_ptr<float>();
+  a.px0_t = prev_x0.stride(0);
+  a.px1 = prev_x1.data_ptr<float>();
+  a.px1_t = prev_x1.stride(0);
+  a.omega = omega.data_ptr<float>();
+  a.H = (int)H;
+
+  if (x1.has_value() && x1->defined()) {
+    check_gpu(*x1, who, "x1");
+    check_dtype(*x1, who, "x1", at::kFloat);
+    TORCH_CHECK(x1->dim() == 2 && x1->size(0) == T && x1->size(1) == H, who,
+                ": x1 must be [T, H]");
+    check_vec_rows(*x1, who, "x1", 4);
+    a.x1 = x1->data_ptr<float>();
+    a.x1_t = x1->stride(0);
+  }
+
+  int64_t P = 0;
+  if (blk.has_value() && blk->defined()) {
+    check_gpu(*blk, who, "blk");
+    check_dtype(*blk, who, "blk", at::kFloat);
+    if (blk->dim() >= 2 && blk->size(1) > 0) {
+      TORCH_CHECK(blk->dim() == 3 && blk->size(0) == T && blk->size(2) == H,
+                  who, ": blk must be [T, P, H]");
+      P = blk->size(1);
+      check_vec_rows(*blk, who, "blk", 4);
+      TORCH_CHECK(prev_blk.has_value() && prev_blk->defined(), who,
+                  ": prev_blk must be defined when blk has P > 0");
+      check_gpu(*prev_blk, who, "prev_blk");
+      check_dtype(*prev_blk, who, "prev_blk", at::kFloat);
+      TORCH_CHECK(prev_blk->dim() == 3 && prev_blk->size(0) == T &&
+                      prev_blk->size(1) >= P && prev_blk->size(2) == H,
+                  who, ": prev_blk must be [T, >= P, H]");
+      check_vec_rows(*prev_blk, who, "prev_blk", 4);
+      a.blk = blk->data_ptr<float>();
+      a.b_t = blk->stride(0);
+      a.b_p = blk->stride(1);
+      a.pblk = prev_blk->data_ptr<float>();
+      a.pb_t = prev_blk->stride(0);
+      a.pb_p = prev_blk->stride(1);
+    } else {
+      TORCH_CHECK(blk->numel() == 0, who, ": blk must be [T, P, H]");
+    }
+  }
+  a.P = (int)P;
+
+  if (omega_blk.has_value() && omega_blk->defined()) {
+    check_gpu(*omega_blk, who, "omega_blk");
+    check_dtype(*omega_blk, who, "omega_blk", at::kFloat);
+    TORCH_CHECK(omega_blk->dim() == 1 && omega_blk->is_contiguous() &&
+                    omega_blk->numel() >= T,
+                who, ": omega_blk must be 1-D contiguous with numel() >= T");
+    a.omega_blk = omega_blk->data_ptr<float>();
+  }
+
+  const at::cuda::OptionalCUDAGuard guard(device_of(x0));
+  const hipStream_t stream = at::cuda::getCurrentCUDAStream();
+  if (T == 0) return;
+  inkling2_glue::loopcd_blend_kernel<0>
+      <<<dim3((unsigned)T, (unsigned)(1 + P)), dim3(256), 0, stream>>>(a);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// ---------------------------------------------------------------------------
+// inkling2_glue_loopcd_readout
+// ---------------------------------------------------------------------------
+void inkling2_glue_loopcd_readout(const torch::Tensor& blocks, int64_t n_blocks,
+                                  const torch::Tensor& x0,
+                                  const std::optional<torch::Tensor>& x1,
+                                  const torch::Tensor& query,
+                                  const torch::Tensor& norm_w,
+                                  const torch::Tensor& out,
+                                  const std::optional<torch::Tensor>& gate_flag,
+                                  double eps, double norm_eps) {
+  const char* who = "inkling2_glue_loopcd_readout";
+  check_gpu(x0, who, "x0");
+  TORCH_CHECK(x0.dim() == 2, who, ": x0 must be [T, H]");
+  const int64_t T = x0.size(0), H = x0.size(1);
+  check_dtype(x0, who, "x0", at::kFloat);
+  check_vec_rows(x0, who, "x0", 4);
+  check_gpu(query, who, "query");
+  TORCH_CHECK(query.dim() == 2 && query.size(0) == 1, who,
+              ": query must be [1, H] (Q == 1)");
+  check_gpu(norm_w, who, "norm_w");
+
+  AttnResArgs a{};
+  bool norm = false;
+  const std::optional<at::Tensor> opt_norm_w(norm_w);
+  fill_attn_res_common(a, who, blocks, n_blocks, T, H, 1, std::nullopt,
+                       std::nullopt, query, opt_norm_w, out, std::nullopt, eps,
+                       norm_eps, norm);
+  TORCH_CHECK(norm, who, ": norm_w must be defined");
+  a.x0 = x0.data_ptr<float>();
+  a.x0_t = x0.stride(0);
+  if (x1.has_value() && x1->defined()) {
+    check_gpu(*x1, who, "x1");
+    check_dtype(*x1, who, "x1", at::kFloat);
+    TORCH_CHECK(x1->dim() == 2 && x1->size(0) == T && x1->size(1) == H, who,
+                ": x1 must be [T, H]");
+    check_vec_rows(*x1, who, "x1", 4);
+    a.x1 = x1->data_ptr<float>();
+    a.x1_t = x1->stride(0);
+  }
+  const int32_t* gate = nullptr;
+  if (gate_flag.has_value() && gate_flag->defined()) {
+    check_gpu(*gate_flag, who, "gate_flag");
+    check_dtype(*gate_flag, who, "gate_flag", at::kInt);
+    TORCH_CHECK(gate_flag->numel() >= 1, who,
+                ": gate_flag must have numel() >= 1");
+    gate = gate_flag->data_ptr<int32_t>();
+  }
+
+  const at::cuda::OptionalCUDAGuard guard(device_of(x0));
+  const hipStream_t stream = at::cuda::getCurrentCUDAStream();
+  if (T == 0) return;
+  int iter, block;
+  row_launch_shape(H, who, iter, block);
+#define I2G_LRO(IT)                                               \
+  case IT:                                                        \
+    inkling2_glue::loopcd_readout_kernel<IT>                      \
+        <<<dim3((unsigned)T), dim3(block), 0, stream>>>(a, gate); \
+    break
+  switch (iter) {
+    I2G_LRO(1);
+    I2G_LRO(2);
+    I2G_LRO(3);
+    I2G_LRO(4);
+    default:
+      TORCH_CHECK(false, "inkling2_glue_loopcd_readout: bad iter ", iter);
+  }
+#undef I2G_LRO
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// ---------------------------------------------------------------------------
+// inkling2_loopcd_prepare_hidden
+// ---------------------------------------------------------------------------
+void inkling2_loopcd_prepare_hidden(
+    const torch::Tensor& omega_out, const torch::Tensor& omega_blk_out,
+    const torch::Tensor& idx_mapping, const torch::Tensor& query_start_loc,
+    const torch::Tensor& seq_lens, const torch::Tensor& prefill_len,
+    const torch::Tensor& req_alpha, const torch::Tensor& req_mode,
+    const torch::Tensor& req_blend_blk, int64_t num_tokens_padded) {
+  const char* who = "inkling2_loopcd_prepare_hidden";
+  const std::pair<const at::Tensor*, const char*> on_gpu[] = {
+      {&omega_out, "omega_out"},        {&omega_blk_out, "omega_blk_out"},
+      {&idx_mapping, "idx_mapping"},    {&query_start_loc, "query_start_loc"},
+      {&seq_lens, "seq_lens"},          {&prefill_len, "prefill_len"},
+      {&req_alpha, "req_alpha"},        {&req_mode, "req_mode"},
+      {&req_blend_blk, "req_blend_blk"}};
+  for (const auto& p : on_gpu) check_gpu(*p.first, who, p.second);
+
+  check_dtype(omega_out, who, "omega_out", at::kFloat);
+  check_dtype(omega_blk_out, who, "omega_blk_out", at::kFloat);
+  TORCH_CHECK(idx_mapping.dim() == 1 && idx_mapping.is_contiguous() &&
+                  (idx_mapping.scalar_type() == at::kInt ||
+                   idx_mapping.scalar_type() == at::kLong),
+              who, ": idx_mapping must be 1-D contiguous int32 or int64");
+  const int64_t num_reqs = idx_mapping.size(0);
+  check_dtype(query_start_loc, who, "query_start_loc", at::kInt);
+  check_dtype(seq_lens, who, "seq_lens", at::kInt);
+  check_dtype(prefill_len, who, "prefill_len", at::kInt);
+  check_dtype(req_alpha, who, "req_alpha", at::kFloat);
+  check_dtype(req_mode, who, "req_mode", at::kInt);
+  check_dtype(req_blend_blk, who, "req_blend_blk", at::kInt);
+
+  TORCH_CHECK(query_start_loc.dim() == 1 && query_start_loc.is_contiguous() &&
+                  query_start_loc.numel() >= num_reqs + 1,
+              who, ": query_start_loc must be 1-D contiguous [>= num_reqs+1]");
+  TORCH_CHECK(seq_lens.dim() == 1 && seq_lens.is_contiguous() &&
+                  seq_lens.numel() >= num_reqs,
+              who, ": seq_lens must be 1-D contiguous [>= num_reqs]");
+  TORCH_CHECK(prefill_len.dim() == 1 && prefill_len.is_contiguous() &&
+                  req_alpha.dim() == 1 && req_alpha.is_contiguous() &&
+                  req_mode.dim() == 1 && req_mode.is_contiguous() &&
+                  req_blend_blk.dim() == 1 && req_blend_blk.is_contiguous(),
+              who, ": request state tables must be 1-D contiguous");
+  const int64_t max_reqs = std::min<int64_t>(
+      std::min<int64_t>(prefill_len.numel(), req_alpha.numel()),
+      std::min<int64_t>(req_mode.numel(), req_blend_blk.numel()));
+  TORCH_CHECK(omega_out.dim() == 1 && omega_out.is_contiguous() &&
+                  omega_blk_out.dim() == 1 && omega_blk_out.is_contiguous(),
+              who, ": omega_out and omega_blk_out must be 1-D contiguous");
+  if (num_tokens_padded <= 0) return;
+  TORCH_CHECK(omega_out.numel() >= num_tokens_padded &&
+                  omega_blk_out.numel() >= num_tokens_padded,
+              who, ": omega outputs must have numel() >= num_tokens_padded");
+
+  LoopcdPrepHiddenArgs a{};
+  a.omega_out = omega_out.data_ptr<float>();
+  a.omega_blk_out = omega_blk_out.data_ptr<float>();
+  a.idx = idx_mapping.data_ptr();
+  a.qsl = query_start_loc.data_ptr<int32_t>();
+  a.seq_lens = seq_lens.data_ptr<int32_t>();
+  a.prefill_len = prefill_len.data_ptr<int32_t>();
+  a.req_alpha = req_alpha.data_ptr<float>();
+  a.req_mode = req_mode.data_ptr<int32_t>();
+  a.req_blend_blk = req_blend_blk.data_ptr<int32_t>();
+  a.num_reqs = (int)num_reqs;
+  a.max_reqs = (int)max_reqs;
+  a.num_tokens_padded = (int)num_tokens_padded;
+  a.ids_i64 = idx_mapping.scalar_type() == at::kLong ? 1 : 0;
+
+  const at::cuda::OptionalCUDAGuard guard(device_of(omega_out));
+  const hipStream_t stream = at::cuda::getCurrentCUDAStream();
+  inkling2_glue::loopcd_prepare_hidden_kernel<0>
+      <<<dim3((unsigned)(num_reqs + 1)), dim3(256), 0, stream>>>(a);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// ---------------------------------------------------------------------------
+// inkling2_loopcd_logits
+// ---------------------------------------------------------------------------
+void inkling2_loopcd_logits(const torch::Tensor& z_final,
+                            const torch::Tensor& z_first,
+                            const torch::Tensor& omega,
+                            const torch::Tensor& log_beta,
+                            const torch::Tensor& adaptive,
+                            const torch::Tensor& stats_scratch) {
+  const char* who = "inkling2_loopcd_logits";
+  check_gpu(z_final, who, "z_final");
+  check_gpu(z_first, who, "z_first");
+  check_gpu(omega, who, "omega");
+  check_gpu(log_beta, who, "log_beta");
+  check_gpu(adaptive, who, "adaptive");
+  check_gpu(stats_scratch, who, "stats_scratch");
+
+  check_dtype(z_final, who, "z_final", at::kFloat);
+  check_dtype(z_first, who, "z_first", at::kFloat);
+  check_dtype(omega, who, "omega", at::kFloat);
+  check_dtype(log_beta, who, "log_beta", at::kFloat);
+  TORCH_CHECK(
+      adaptive.scalar_type() == at::kInt || adaptive.scalar_type() == at::kBool,
+      who, ": adaptive must be int32 or bool");
+  check_dtype(stats_scratch, who, "stats_scratch", at::kFloat);
+
+  TORCH_CHECK(z_final.dim() == 2 && z_first.dim() == 2 &&
+                  z_first.sizes() == z_final.sizes(),
+              who, ": z_final and z_first must be [B, V] of one shape");
+  const int64_t B = z_final.size(0), V = z_final.size(1);
+  TORCH_CHECK(z_final.stride(1) == 1 && z_first.stride(1) == 1, who,
+              ": z_final and z_first must have unit stride on V");
+  TORCH_CHECK(B <= 1 || z_final.stride(0) >= V, who,
+              ": z_final row stride must be >= V");
+  TORCH_CHECK(omega.dim() == 1 && omega.is_contiguous() && omega.numel() >= B,
+              who, ": omega must be 1-D contiguous [>= B]");
+  TORCH_CHECK(
+      log_beta.dim() == 1 && log_beta.is_contiguous() && log_beta.numel() >= B,
+      who, ": log_beta must be 1-D contiguous [>= B]");
+  TORCH_CHECK(
+      adaptive.dim() == 1 && adaptive.is_contiguous() && adaptive.numel() >= B,
+      who, ": adaptive must be 1-D contiguous [>= B]");
+  TORCH_CHECK(
+      stats_scratch.is_contiguous() && stats_scratch.numel() >= B * 32 * 2, who,
+      ": stats_scratch must be contiguous fp32 [>= B*32*2]");
+
+  const at::cuda::OptionalCUDAGuard guard(device_of(z_final));
+  const hipStream_t stream = at::cuda::getCurrentCUDAStream();
+  if (B == 0 || V == 0) return;
+
+  int S = std::clamp<int>((int)(72 / std::max<int64_t>(B, 1)), 1, 32);
+  S = std::min<int>(S, (int)((V + 255) / 256));
+  S = std::max<int>(S, 1);
+
+  LoopcdLogitsArgs a{};
+  a.zf = z_final.data_ptr<float>();
+  a.zf_s = z_final.stride(0);
+  a.zw = z_first.data_ptr<float>();
+  a.zw_s = z_first.stride(0);
+  a.omega = omega.data_ptr<float>();
+  a.log_beta = log_beta.data_ptr<float>();
+  a.adap = adaptive.data_ptr();
+  a.stats = stats_scratch.data_ptr<float>();
+  a.V = (int)V;
+  a.S = S;
+  a.adap_bool = adaptive.scalar_type() == at::kBool ? 1 : 0;
+
+  const dim3 grid((unsigned)S, (unsigned)B);
+  const dim3 block(256);
+  inkling2_glue::loopcd_logits_stats_kernel<0><<<grid, block, 0, stream>>>(a);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  inkling2_glue::loopcd_logits_apply_kernel<0><<<grid, block, 0, stream>>>(a);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

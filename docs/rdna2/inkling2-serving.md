@@ -32,12 +32,11 @@ bash tools/rdna/serve_rdna.sh RECIPE=inkling2-mini-tp1 MODEL=/path/to/inkling2-m
 
 | Recipe | Cards | Port | `MAXLEN` | `SEQS` | `MAXBAT` | Use it for |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| [`inkling2-mini-tp1`](../../tools/rdna/recipes/inkling2-mini-tp1.env) | 1 | 18221 | 180,000 | 16 | 1,024 | one card: short and medium contexts, up to 16 concurrent requests |
-| [`inkling2-mini-tp2`](../../tools/rdna/recipes/inkling2-mini-tp2.env) | 2 | 18222 | 1,048,576 | 8 | 184 | the full context on two cards; lower latency than TP=1 |
-| [`inkling2-mini-tp4`](../../tools/rdna/recipes/inkling2-mini-tp4.env) | 4 | 18223 | 1,048,576 | 8 | 4,096 | the full context with room for two such requests; fastest prefill |
-| [`inkling2-mini-tp1-dspark`](../../tools/rdna/recipes/inkling2-mini-tp1-dspark.env) | 1 | 18221 | 125,000 | 2 | 1,024 | `inkling2-mini-tp1` with the DSpark draft: one request decodes 1.3x faster (1.1x - 1.6x by kind of text), two about 1.1x, with less context |
-| [`inkling2-mini-tp1-dspark-adaptive`](../../tools/rdna/recipes/inkling2-mini-tp1-dspark-adaptive.env) | 1 | 18221 | 105,000 | 2 | 1,024 | that with adaptive K and a 32,768-id draft vocabulary (an ids file made once): one request decodes 1.5x faster, with less context still |
-| [`inkling2-mini-tp2-dspark`](../../tools/rdna/recipes/inkling2-mini-tp2-dspark.env) | 2 | 18222 | 780,000 | 2 | 184 | `inkling2-mini-tp2` with the DSpark draft: one request decodes 1.35x faster (1.15x - 1.62x by kind of text), with less context |
+| [`inkling2-mini-tp1`](../../tools/rdna/recipes/inkling2-mini-tp1.env) | 1 | 18221 | 194,000 | 16 | 1,024 | plain TP=1: max single-card context (194k), up to 16 concurrent requests |
+| [`inkling2-mini-tp1-dspark`](../../tools/rdna/recipes/inkling2-mini-tp1-dspark.env) | 1 | 18221 | 135,000 | 16 | 1,024 | TP=1 with DSpark (`[[1,2,2],[3,16,0]]`): +38% decode, zero c=8 collapse; supports `ADAPTIVE=1` (`MAXLEN=125000`) and `DRAFT_VOCAB=...` |
+| [`inkling2-mini-tp1-offload`](../../tools/rdna/recipes/inkling2-mini-tp1-offload.env) | 1 | 18221 | 65,536 | 8 | 512 | unified 16 GiB & 32 GiB TP=1 MoE expert offload (`EXPERT_SLOTS=48`, `9.36 GiB` model VRAM): boots at `12.94 GiB` peak on 16 GiB (`71k` KV) and scales to `432k–502k` KV on 32 GiB (`MAXLEN=430000` verified; `EXPERT_CACHE_COPY=native` for +11–14% prefill) |
+| [`inkling2-mini-tp2`](../../tools/rdna/recipes/inkling2-mini-tp2.env) | 2 | 18222 | 760,000 | 8 | 1,024 | best TP=2: DSpark ON by default (`[[1,2,2],[3,8,0]]`, +39% decode, +64–73% prefill); `ADAPTIVE=1` (`MAXLEN=720000`) / `DRAFT_VOCAB=...`; `DSPARK=0` for full 1M context (`MAXBAT=320`) |
+| [`inkling2-mini-tp4`](../../tools/rdna/recipes/inkling2-mini-tp4.env) | 4 | 18223 | 1,048,576 | 8 | 4,096 | best TP=4: full 1M context with DSpark ON by default (`[[1,2,2],[3,8,0]]`); `ADAPTIVE=1` (1M ctx still fits) / `DRAFT_VOCAB=...`; `DSPARK=0` for plain decoding (2.25M KV) |
 
 All three serve the model as `inkling2-mini` on `127.0.0.1`, capture HIP graphs
 (`FULL_AND_PIECEWISE`, the model's default capture grid), enable prefix caching and accept one
@@ -84,7 +83,7 @@ capture included): TP=1 44 s, TP=2 64 s, TP=4 59 s [measured, `serve_one.sh`].
 | `EAGER` | 0 | 1 | `1` runs without HIP graphs (`--enforce-eager`) | decode +2 to +13% per token (table below), KV pool +10% at TP=1, SEQS 16 |
 | `SEQS` | 16 (TP=1), 8 | 1 - 16 | `--max-num-seqs`; decode graphs for 1 .. min(16, `SEQS`) requests | each size is a graph; at TP=1 the 16 + 7 graphs take 0.70 GiB of the KV budget |
 | `MAXBAT` | 1,024 / 184 / 4,096 | any | `--max-num-batched-tokens`: the prefill chunk; steps above 32 tokens run eager | at TP=2 every token of it takes 1.92 MiB of the KV budget [derived from the boots below]; larger chunks prefill faster |
-| `MAXLEN` | 180,000 / 1,048,576 | lower | `--max-model-len`; the engine refuses a length the KV pool cannot hold once | see "Long context" |
+| `MAXLEN` | 194,000 / 1,048,576 | lower | `--max-model-len`; the engine refuses a length the KV pool cannot hold once | see "Long context" |
 | `VLLM_KV_CACHE_MARGIN_FLOOR_MIB` | 2048 (TP=2 only) | empty | the memory the KV sizing keeps free beyond its measured transient peak (engine default 3 GiB on ROCm) | the full context at TP=2 needs it (see "Long context") |
 | `RDNA_AR`, `VLLM_RDNA_AR_MAX_KB`, `VLLM_RDNA_AR_ONESHOT_KB` | 1, 256, 256 (TP > 1) | `RDNA_AR=0` | the one-shot HIP all-reduce up to 256 KiB (28 decode tokens in fp32), RCCL above; captured inside the graphs | the cost of RCCL for every reduction was not measured: no decode step needed the fallback |
 | `COMPILATION_CONFIG` | unset | JSON | an explicit capture grid, e.g. `{"cudagraph_mode":"FULL_AND_PIECEWISE","decode_cudagraph_capture_request_sizes":[1,2,4,8]}` | fewer graphs, less KV budget spent; a request count without its own graph replays in the next larger one (3 rows in the 4-row graph cost 35.4 ms against 30.8 ms in an exact one, port spec part B) |
@@ -92,16 +91,63 @@ capture included): TP=1 44 s, TP=2 64 s, TP=4 59 s [measured, `serve_one.sh`].
 | `VLLM_INKLING2_PREFILL_BM` | 1 (code default, not set by the recipes) | `0` | the fp16 `v_dot2` 32-row expert kernels for the MoE chunks of at least `VLLM_INKLING2_PREFILL_BM_MIN_TOKENS` tokens; `0` restores the shipped decode-shaped kernels (A/B and rollback) | 1,000-token prefill 873 - 883 ms -> 487 ms at TP=1 [measured, `inkling2-moe-prefill-bm.md`]; decode and graphs untouched |
 | `VLLM_INKLING2_PREFILL_INT8` | 0 | `1` | **experimental**: W4A8 int8 kernel for the NVFP4 layers (quantises the activations: a quality change, off by default) | 487.6 -> 452.5 ms at 1,000 tokens; NLL 0.0574 against the shipped path's own 0.0477 floor [measured] |
 | `VLLM_INKLING2_PREFILL_BM_MIN_TOKENS` | 128 | any | the chunk size from which the 32-row expert kernels run; smaller chunks, decode and every graph step keep the shipped kernels | NVFP4 breaks even at ~48 tokens, MXFP8 at ~128 [measured] |
+| `LOOPCD_ALPHA`, `LOOPCD_MODE`, `LOOPCD_ADAPTIVE`, `LOOPCD_BETA`, `LOOPCD_BLEND_BLOCKS`, `LOOPCD_WEAK_PASS` | `0.0` (off), `hidden`, `0`, `0.1`, `1`, `-1` | per-request `vllm_xargs` or `LOOPCD_ALPHA>0` | training-free LoopCD contrastive decoding (`arXiv:2610.02185`); no separate recipe needed, works with prefix caching and DSpark | `hidden` (`alpha=0.35`): `+0.14%` latency (`+25 µs/tok`), `0 B` extra residual VRAM, `+5 pp` Math+Code; `logits` adaptive (`alpha=0.25`): `+10–13%` `b=1` latency, `+15 pp` Math+Code ([measured](../explore/loopcd-2610.02185/README.md)) |
+
+### LoopCD (per-request and server-wide contrastive decoding)
+
+Every Inkling-2 recipe supports **LoopCD (`arXiv:2610.02185`)** out of the box without a separate recipe or graph recapture. Requests with different `loopcd_*` settings can mix in the same batch while sharing prompt prefix caches (non-terminal prompt tokens are always masked to `alpha = 0`).
+
+Pass `vllm_xargs` on any `/v1/chat/completions` request:
+
+```bash
+# LoopCD-Hidden: almost free (+0.14% at b=1, +5 pp Math+Code, Pareto-better with DSpark)
+curl -s http://127.0.0.1:18221/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "model": "inkling2-mini",
+  "messages": [{"role": "user", "content": "Solve: ..."}],
+  "max_tokens": 2048,
+  "temperature": 0.0,
+  "vllm_xargs": {
+    "loopcd_mode": "hidden",
+    "loopcd_alpha": 0.35,
+    "loopcd_blend_blocks": true
+  }
+}'
+
+# LoopCD-Logits (adaptive): largest reasoning/coding gain (+15 pp Math+Code, shorter chains)
+curl -s http://127.0.0.1:18221/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "model": "inkling2-mini",
+  "messages": [{"role": "user", "content": "Solve: ..."}],
+  "max_tokens": 2048,
+  "temperature": 0.0,
+  "vllm_xargs": {
+    "loopcd_mode": "logits",
+    "loopcd_alpha": 0.25,
+    "loopcd_adaptive": true,
+    "loopcd_beta": 0.1,
+    "loopcd_weak_pass": -1
+  }
+}'
+```
+
+To set a server-wide default (still overridable per request via `vllm_xargs`), append `LOOPCD_*` switches to `serve_rdna.sh`:
+
+```bash
+bash tools/rdna/serve_rdna.sh RECIPE=inkling2-mini-tp1-dspark MODEL=/path/to/inkling2-mini \
+  VENV=/path/to/venv HIP_VISIBLE_DEVICES=2 ADAPTIVE=1 DRAFT_VOCAB=/path/to/32k.npy \
+  LOOPCD_MODE=hidden LOOPCD_ALPHA=0.35
+```
+
+Full architecture, kernel microbenchmarks, and Math+Code eval receipts: [`docs/explore/loopcd-2610.02185/README.md`](../explore/loopcd-2610.02185/README.md).
 
 The default capture grid for this architecture is decode graphs for every request count from 1
 to min(16, `SEQS`) and mixed / prefill graphs for 1, 2, 4, 8, 16, 24 and 32 tokens; a step with
 more tokens (a prefill chunk) runs eager.
 
-The prefill expert kernels apply to the layers whose expert K fits (TP=1: every NVFP4 and MXFP8
-layer). At TP=2 / TP=4 the intermediate size is sharded to 576 / 288 and only the MXFP8 layers
-(K = 288) take them; the NVFP4 layers keep the shipped kernels. The prefill timings below
-(`Boot, capture and prefix cache`, `Long context`, the full-length prompts) were measured with
-the shipped expert kernels; see "Prefill (expert kernels)" for the 32-row kernels.
+The prefill expert kernels apply to every NVFP4 and MXFP8 layer across TP=1 (I = 1152),
+TP=2 (I = 576), and TP=4 (I = 288) (`K % 32 == 0` supported for both formats). The earlier
+prefill timings below (`Boot, capture and prefix cache`, `Long context`, the full-length prompts)
+were measured with the shipped expert kernels; see "Prefill (expert kernels)" and
+[`inkling2-moe-prefill-bm.md`](inkling2-moe-prefill-bm.md) for the 32-row kernels.
 
 ## Slots and memory
 
@@ -114,11 +160,11 @@ Per rank, from the engine's boot log of the recipes [measured]:
 | KV per token (the 8 full-attention layer visits of the loop; the sliding-window layers add a bounded amount per request) | 32 KiB | 16 KiB | 8 KiB |
 | one 1,048,576-token request | 32 GiB | 16.1 GiB | 8.2 GiB |
 | HIP graphs (engine log "took") | 0.70 GiB (SEQS 16) | 0.19 GiB (SEQS 8) | between -0.50 and 0.30 GiB (below the counter's resolution) |
-| KV pool of the recipe | 180,986 tokens | 1,062,736 tokens | 2,250,192 tokens |
+| KV pool of the recipe | 196,065 tokens | 1,062,736 tokens | 2,250,192 tokens |
 
 The pool is what is left: free memory after warmup and graph capture, less the margin (engine
 default 3 GiB on ROCm, 2 GiB at TP=2 in the recipe) and the transient activation peak the warmup measured
-(0.77 GiB at TP=1, 0.3 GiB at TP=2 with chunks of 184 tokens). Capture comes out of the same budget: at
+(0.19 GiB at TP=1 after `prompt_logprob` chunk cap, 0.3 GiB at TP=2 with chunks of 184 tokens). Capture comes out of the same budget: at
 TP=1 SEQS 16 costs 9.5% of the KV tokens of a 4,096-token engine (45,175 eager, 40,876 with graphs).
 Prefix caching keeps conv state per 64-token block, so a hit covers whole blocks (128 of 134 tokens in
 the image test below).
@@ -264,9 +310,9 @@ full context back at TP=2; it is not built (`docs/rdna2/inkling2-dspark.md`).
   (349 tok/s) and 25.3 minutes at TP=4 (690 tok/s), against 811 and 1,589 tok/s for a 261k prompt (the rate
   falls with depth). Each was run once, one needle at depth 0.5; several long prompts at once and a long prompt
   with an image were not run.
-- **TP=1 holds about 181k tokens, not the model's million**: the KV cache is 32 KiB per token (eight
-  full-attention layer visits, counting the three passes of the loop) and 18.68 GiB of the 29.98 GiB are
-  weights. The recipe is 180,000.
+- **TP=1 holds about 196k tokens, not the model's million**: the KV cache is 32 KiB per token (eight
+  full-attention layer visits, counting the two passes of the loop) and 18.68 GiB of the 29.98 GiB are
+  weights. The recipe is 194,000.
 - **The TP=2 recipe lowers the engine's KV margin floor to 2 GiB.** With the default 3 GiB the full context
   does not fit once graphs are captured (see "Long context").
 - **Greedy output is not bit-stable**: two runs of the same eager engine produce different continuations
@@ -379,3 +425,6 @@ ran on it, the suites were not re-run on the rebuilt library. Pre-commit clean.
   and the memory it costs.
 - [`inkling2-moe-prefill-bm.md`](inkling2-moe-prefill-bm.md): the prefill expert kernels (default on), their
   switches, launch list, quality gates, measurements, tests and the experimental W4A8 variant.
+- [`docs/explore/inkling2-moe-offload-tp1/README.md`](../explore/inkling2-moe-offload-tp1/README.md): TP=1 MoE
+  expert offloading (`inkling2-mini-tp1-offload`) architecture, 16 GiB cap and 32 GiB full-KV qualification,
+  Pass-0/Pass-1 hit rates, and `tensor` vs `native` copy A/B.
